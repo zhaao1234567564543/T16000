@@ -561,7 +561,11 @@ CC = bwconncomp(model, 26);
 cluster.numClusters = CC.NumObjects;
 if CC.NumObjects == 0
     cluster.sizes = [];
-    cluster.sizeDistribution = [];
+    cluster.minSize = 0;
+    cluster.maxSize = 0;
+    cluster.meanSize = 0;
+    cluster.stdSize = 0;
+    cluster.sizeDistribution = struct('counts', [], 'edges', []);
     cluster.centroids = [];
     cluster.spatialDispersion = 0;
     cluster.shapeDiversity = 0;
@@ -831,6 +835,10 @@ end
 function kl = computeKLDivergence(dist1, dist2)
 % 计算KL散度
 if isempty(dist1.counts) || isempty(dist2.counts)
+    kl = 1;
+    return;
+end
+if sum(dist1.counts) == 0 || sum(dist2.counts) == 0
     kl = 1;
     return;
 end
