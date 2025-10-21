@@ -1136,13 +1136,32 @@ if ~isempty(origMorph.elongation) && ~isempty(iterMorph.elongation)
 end
 % 形态指标箱线图
 subplot(2,3,3);
-if ~isempty(origMorph.sphericity) && ~isempty(iterMorph.sphericity)
-    data1 = [origMorph.sphericity; origMorph.elongation; origMorph.compactness];
-    data2 = [iterMorph.sphericity; iterMorph.elongation; iterMorph.compactness];
-    
-    positions = [1 2 4 5 7 8];
-    boxplot([data1' data2'], positions, 'Colors', 'brbrbr');
-    set(gca, 'XTick', [1.5 4.5 7.5], 'XTickLabel', {'球形度', '伸长率', '紧凑度'});
+featureFields = {'sphericity', 'elongation', 'compactness'};
+featureLabels = {'球形度', '伸长率', '紧凑度'};
+boxColumns = {};
+validFeatureIdx = [];
+for i = 1:numel(featureFields)
+    origData = origMorph.(featureFields{i});
+    iterData = iterMorph.(featureFields{i});
+    if isempty(origData) || isempty(iterData)
+        continue;
+    end
+    boxColumns{end+1} = origData(:); %#ok<AGROW>
+    boxColumns{end+1} = iterData(:); %#ok<AGROW>
+    validFeatureIdx(end+1) = i; %#ok<AGROW>
+end
+if ~isempty(boxColumns)
+    maxLen = max(cellfun(@numel, boxColumns));
+    dataMatrix = NaN(maxLen, numel(boxColumns));
+    for k = 1:numel(boxColumns)
+        columnData = boxColumns{k};
+        dataMatrix(1:numel(columnData), k) = columnData;
+    end
+    basePositions = (0:(numel(validFeatureIdx)-1)) * 3;
+    positions = reshape([basePositions + 1; basePositions + 2], 1, []);
+    colorOrder = repmat([0 0 1; 1 0 0], numel(validFeatureIdx), 1);
+    boxplot(dataMatrix, 'Positions', positions, 'Colors', colorOrder);
+    set(gca, 'XTick', basePositions + 1.5, 'XTickLabel', featureLabels(validFeatureIdx));
     ylabel('值');
     title('形态特征分布对比');
 end
