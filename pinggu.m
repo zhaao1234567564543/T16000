@@ -564,6 +564,7 @@ if CC.NumObjects == 0
     cluster.sizeDistribution = [];
     cluster.centroids = [];
     cluster.spatialDispersion = 0;
+    cluster.shapeDiversity = 0;
     return;
 end
 % 基本统计
@@ -808,7 +809,19 @@ end
 cluster.dispersionDiff = abs(orig.spatialDispersion - iter.spatialDispersion);
 cluster.dispersionMatch = max(0, 1 - cluster.dispersionDiff);
 % 形状多样性
-cluster.diversityDiff = abs(orig.shapeDiversity - iter.shapeDiversity);
+if isfield(orig, 'shapeDiversity') && ~isempty(orig.shapeDiversity)
+    origDiversity = orig.shapeDiversity;
+else
+    origDiversity = 0;
+end
+
+if isfield(iter, 'shapeDiversity') && ~isempty(iter.shapeDiversity)
+    iterDiversity = iter.shapeDiversity;
+else
+    iterDiversity = 0;
+end
+
+cluster.diversityDiff = abs(origDiversity - iterDiversity);
 cluster.diversityMatch = max(0, 1 - cluster.diversityDiff);
 % 综合簇匹配度
 cluster.overall = mean([cluster.numMatch, cluster.meanSizeMatch, ...
