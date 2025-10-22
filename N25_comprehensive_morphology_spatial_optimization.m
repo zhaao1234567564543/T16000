@@ -618,29 +618,28 @@ function tpc = computeFastTwoPointCorrelation(binaryModel, keyDistances, usePara
             tpc(i, :) = computeTPCRow(keyDistances(i), binaryModel);
         end
     end
-
-    function row = computeTPCRow(lag, volume)
-        % 根据距离自适应采样步长
-        sampleStep = max(1, round(lag / 10));
-        sampledModel = volume(1:sampleStep:end, 1:sampleStep:end, 1:sampleStep:end);
-        if isempty(sampledModel)
-            row = repmat(mean(volume(:))^2, 1, 3);
-            return;
+end
+function row = computeTPCRow(lag, volume)
+    % 根据距离自适应采样步长
+    sampleStep = max(1, round(lag / 10));
+    sampledModel = volume(1:sampleStep:end, 1:sampleStep:end, 1:sampleStep:end);
+    if isempty(sampledModel)
+        row = repmat(mean(volume(:))^2, 1, 3);
+        return;
+    end
+    row = zeros(1, 3);
+    for dir = 1:3
+        shiftVec = [0, 0, 0];
+        effectiveShift = max(1, round(lag / sampleStep));
+        maxShift = size(sampledModel, dir) - 1;
+        if maxShift <= 0
+            row(dir) = mean(sampledModel(:))^2;
+            continue;
         end
-        row = zeros(1, 3);
-        for dir = 1:3
-            shiftVec = [0, 0, 0];
-            effectiveShift = max(1, round(lag / sampleStep));
-            maxShift = size(sampledModel, dir) - 1;
-            if maxShift <= 0
-                row(dir) = mean(sampledModel(:))^2;
-                continue;
-            end
-            effectiveShift = min(effectiveShift, maxShift);
-            shiftVec(dir) = effectiveShift;
-            shifted = circshift(sampledModel, shiftVec);
-            row(dir) = mean(sampledModel(:) .* shifted(:));
-        end
+        effectiveShift = min(effectiveShift, maxShift);
+        shiftVec(dir) = effectiveShift;
+        shifted = circshift(sampledModel, shiftVec);
+        row(dir) = mean(sampledModel(:) .* shifted(:));
     end
 end
 function aniso = computeQuickAnisotropy(binaryModel)
