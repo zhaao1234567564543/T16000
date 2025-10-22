@@ -37,6 +37,17 @@ else
     fprintf('将使用原始模型大小: %d × %d × %d\n', dims(1), dims(2), dims(3));
 end
 fileName = 'DATA1.raw'; % 输入文件
+%% 启动高并行度计算环境
+parallelEnabled = true;
+parallelPool = [];
+if parallelEnabled
+    parallelPool = ensureHighUtilizationPool();
+    if ~isempty(parallelPool)
+        fprintf('已启用并行池，工作器数量：%d\n', parallelPool.NumWorkers);
+    else
+        fprintf('未能启动并行池，将以串行模式运行。\n');
+    end
+end
 % 读取原始模型（使用原始尺寸）
 rawModel = readRawModel(fileName, originalDims);
 % 如果需要，调整原始模型大小
@@ -295,6 +306,28 @@ function saveRawModel(model, fileName)
     fclose(fid);
     fprintf('模型已保存至: %s\n', fileName);
 end
+function pool = ensureHighUtilizationPool()
+    % 启动并行池以充分利用CPU资源
+    try
+        pool = gcp('nocreate');
+        if isempty(pool)
+            localCluster = parcluster('local');
+            try
+                desiredWorkers = feature('numcores');
+            catch
+                desiredWorkers = localCluster.NumWorkers;
+            end
+            if isempty(desiredWorkers) || ~isfinite(desiredWorkers) || desiredWorkers <= 0
+                desiredWorkers = localCluster.NumWorkers;
+            end
+            desiredWorkers = min(localCluster.NumWorkers, max(1, round(desiredWorkers)));
+            pool = parpool(localCluster, desiredWorkers);
+        end
+    catch poolError
+        warning('启动并行池失败：%s', poolError.message);
+        pool = [];
+    end
+end
 %% ========== 特征提取函数 ==========
 function features = extractEfficientClusterFeatures(binaryModel)
     % 高效提取簇特征
@@ -316,28 +349,31 @@ function features = extractEfficientClusterFeatures(binaryModel)
     nSample = min(100, CC.NumObjects);
     if nSample > 0
         sampleIdx = randperm(CC.NumObjects, nSample);
-        features.centroids = zeros(nSample, 3);
-        features.compactness = zeros(nSample, 1);
-        
-        for i = 1:nSample
+        centroids = zeros(nSample, 3);
+        compactness = zeros(nSample, 1);
+
+        parfor i = 1:nSample
             idx = sampleIdx(i);
             [x, y, z] = ind2sub(size(binaryModel), CC.PixelIdxList{idx});
-            
+
             % 质心
-            features.centroids(i, :) = [mean(x), mean(y), mean(z)];
-            
+            centroids(i, :) = [mean(x), mean(y), mean(z)];
+
             % 紧凑度
             rangeX = max(x) - min(x) + 1;
             rangeY = max(y) - min(y) + 1;
             rangeZ = max(z) - min(z) + 1;
             boundingBoxVolume = rangeX * rangeY * rangeZ;
-            
+
             if boundingBoxVolume > 0
-                features.compactness(i) = length(CC.PixelIdxList{idx}) / boundingBoxVolume;
+                compactness(i) = length(CC.PixelIdxList{idx}) / boundingBoxVolume;
             else
-                features.compactness(i) = 1;
+                compactness(i) = 1;
             end
         end
+
+        features.centroids = centroids;
+        features.compactness = compactness;
         
         % 空间均匀性
         if size(features.centroids, 1) > 1
@@ -426,69 +462,78 @@ function morphologyFeatures = computeDetailedMorphologyFeatures(binaryModel)
     analyzeIdx = sortIdx(1:nAnalyze);
     
     % 初始化特征数组
-    morphologyFeatures.elongation = zeros(nAnalyze, 1);
-    morphologyFeatures.sphericity = zeros(nAnalyze, 1);
-    morphologyFeatures.convexity = zeros(nAnalyze, 1);
-    morphologyFeatures.solidity = zeros(nAnalyze, 1);
-    
+    elongation = zeros(nAnalyze, 1);
+    sphericity = zeros(nAnalyze, 1);
+    convexity = zeros(nAnalyze, 1);
+    solidity = zeros(nAnalyze, 1);
+
     % 计算每个簇的形态特征
-    for i = 1:nAnalyze
+    parfor i = 1:nAnalyze
         idx = analyzeIdx(i);
         [x, y, z] = ind2sub(size(binaryModel), CC.PixelIdxList{idx});
-        
+
+        localElongation = 1;
+        localSphericity = 0.8;
+        localConvexity = 0.8;
+        localSolidity = 0.8;
+
         if length(x) > 10 % 只对足够大的簇计算
             % 主成分分析
             coords = [x - mean(x), y - mean(y), z - mean(z)];
             try
-                [V, D] = eig(cov(coords));
+                [~, D] = eig(cov(coords));
                 eigenvalues = diag(D);
                 eigenvalues = sort(eigenvalues, 'descend');
-                
+
                 % 伸长率
                 if eigenvalues(3) > 0
-                    morphologyFeatures.elongation(i) = sqrt(eigenvalues(1) / eigenvalues(3));
+                    localElongation = sqrt(eigenvalues(1) / eigenvalues(3));
                 else
-                    morphologyFeatures.elongation(i) = 1;
+                    localElongation = 1;
                 end
-                
+
                 % 球形度（简化计算）
                 volume = length(x);
                 % 使用椭球体近似
-                a = sqrt(eigenvalues(1));
-                b = sqrt(eigenvalues(2));
-                c = sqrt(eigenvalues(3));
+                a = sqrt(max(eigenvalues(1), 0));
+                b = sqrt(max(eigenvalues(2), 0));
+                c = sqrt(max(eigenvalues(3), 0));
                 if a > 0 && b > 0 && c > 0
                     ellipsoidVolume = (4/3) * pi * a * b * c;
-                    morphologyFeatures.sphericity(i) = (volume / ellipsoidVolume)^(1/3);
+                    localSphericity = (volume / ellipsoidVolume)^(1/3);
                 else
-                    morphologyFeatures.sphericity(i) = 0.5;
+                    localSphericity = 0.5;
                 end
-                
+
                 % 凸性
                 rangeX = max(x) - min(x) + 1;
                 rangeY = max(y) - min(y) + 1;
                 rangeZ = max(z) - min(z) + 1;
                 boundingBoxVolume = rangeX * rangeY * rangeZ;
-                morphologyFeatures.convexity(i) = volume / boundingBoxVolume;
-                
+                localConvexity = volume / boundingBoxVolume;
+
                 % 实心度
-                morphologyFeatures.solidity(i) = morphologyFeatures.convexity(i);
-                
+                localSolidity = localConvexity;
+
             catch
                 % 如果PCA失败，使用默认值
-                morphologyFeatures.elongation(i) = 1;
-                morphologyFeatures.sphericity(i) = 0.5;
-                morphologyFeatures.convexity(i) = 0.5;
-                morphologyFeatures.solidity(i) = 0.5;
+                localElongation = 1;
+                localSphericity = 0.5;
+                localConvexity = 0.5;
+                localSolidity = 0.5;
             end
-        else
-            % 小簇使用默认值
-            morphologyFeatures.elongation(i) = 1;
-            morphologyFeatures.sphericity(i) = 0.8;
-            morphologyFeatures.convexity(i) = 0.8;
-            morphologyFeatures.solidity(i) = 0.8;
         end
+
+        elongation(i) = localElongation;
+        sphericity(i) = localSphericity;
+        convexity(i) = localConvexity;
+        solidity(i) = localSolidity;
     end
+
+    morphologyFeatures.elongation = elongation;
+    morphologyFeatures.sphericity = sphericity;
+    morphologyFeatures.convexity = convexity;
+    morphologyFeatures.solidity = solidity;
     
     % 计算网络特征
     morphologyFeatures.poreNetworkDensity = computePoreNetworkDensity(binaryModel);
@@ -526,7 +571,9 @@ function multiScaleFeatures = computeMultiScaleSpatialFeatures(binaryModel)
         scales = [1, scales];
     end
     baseDistances = [1, 3, 5, 10, 15, 20, 30, 40, 50, 70];
-    for s = 1:length(scales)
+    numScales = length(scales);
+    scaleResults = cell(1, numScales);
+    parfor s = 1:numScales
         scale = scales(s);
         % 下采样
         if scale > 1
@@ -540,42 +587,59 @@ function multiScaleFeatures = computeMultiScaleSpatialFeatures(binaryModel)
         if isempty(validDistances)
             validDistances = baseDistances(1);
         end
-        % 计算各尺度的特征
-        multiScaleFeatures.scale(s).scaleFactor = scale;
-        multiScaleFeatures.scale(s).twoPointCorr = computeFastTwoPointCorrelation(scaledModel, validDistances);
-        multiScaleFeatures.scale(s).keyDistances = validDistances;
-        multiScaleFeatures.scale(s).clusterDistribution = computeClusterDistribution(scaledModel);
-        multiScaleFeatures.scale(s).spatialSpectrum = computeSpatialSpectrum(scaledModel);
+        scaleStruct = struct();
+        scaleStruct.scaleFactor = scale;
+        scaleStruct.twoPointCorr = computeFastTwoPointCorrelation(scaledModel, validDistances, false);
+        scaleStruct.keyDistances = validDistances;
+        scaleStruct.clusterDistribution = computeClusterDistribution(scaledModel);
+        scaleStruct.spatialSpectrum = computeSpatialSpectrum(scaledModel);
+        scaleResults{s} = scaleStruct;
     end
+    multiScaleFeatures.scale = [scaleResults{:}];
     % 计算尺度不变特征
     multiScaleFeatures.scaleInvariantFeatures = computeScaleInvariantFeatures(binaryModel);
 end
 %% ========== 特征计算辅助函数 ==========
-function tpc = computeFastTwoPointCorrelation(binaryModel, keyDistances)
+function tpc = computeFastTwoPointCorrelation(binaryModel, keyDistances, useParallel)
     % 快速计算两点相关函数，支持更大的尺度
+    if nargin < 3 || isempty(useParallel)
+        useParallel = true;
+    end
+
     nDistances = length(keyDistances);
     tpc = zeros(nDistances, 3);
-    for i = 1:nDistances
-        lag = keyDistances(i);
+
+    if useParallel && nDistances > 1
+        parfor i = 1:nDistances
+            tpc(i, :) = computeTPCRow(keyDistances(i), binaryModel);
+        end
+    else
+        for i = 1:nDistances
+            tpc(i, :) = computeTPCRow(keyDistances(i), binaryModel);
+        end
+    end
+
+    function row = computeTPCRow(lag, volume)
         % 根据距离自适应采样步长
         sampleStep = max(1, round(lag / 10));
-        sampledModel = binaryModel(1:sampleStep:end, 1:sampleStep:end, 1:sampleStep:end);
+        sampledModel = volume(1:sampleStep:end, 1:sampleStep:end, 1:sampleStep:end);
         if isempty(sampledModel)
-            tpc(i, :) = mean(binaryModel(:))^2;
-            continue;
+            row = repmat(mean(volume(:))^2, 1, 3);
+            return;
         end
+        row = zeros(1, 3);
         for dir = 1:3
             shiftVec = [0, 0, 0];
             effectiveShift = max(1, round(lag / sampleStep));
             maxShift = size(sampledModel, dir) - 1;
             if maxShift <= 0
-                tpc(i, dir) = mean(sampledModel(:))^2;
+                row(dir) = mean(sampledModel(:))^2;
                 continue;
             end
             effectiveShift = min(effectiveShift, maxShift);
             shiftVec(dir) = effectiveShift;
             shifted = circshift(sampledModel, shiftVec);
-            tpc(i, dir) = mean(sampledModel(:) .* shifted(:));
+            row(dir) = mean(sampledModel(:) .* shifted(:));
         end
     end
 end
@@ -613,21 +677,21 @@ function grad = computePorosityGradient(binaryModel)
     
     localPorosity = zeros(nWindowsX, nWindowsY, nWindowsZ);
     
-    for i = 1:nWindowsX
-        for j = 1:nWindowsY
-            for k = 1:nWindowsZ
-                x1 = (i-1)*stride + 1;
-                y1 = (j-1)*stride + 1;
-                z1 = (k-1)*stride + 1;
-                x2 = min(x1+windowSize-1, nx);
-                y2 = min(y1+windowSize-1, ny);
-                z2 = min(z1+windowSize-1, nz);
-                
-                window = binaryModel(x1:x2, y1:y2, z1:z2);
-                localPorosity(i,j,k) = mean(window(:));
-            end
-        end
+    totalWindows = nWindowsX * nWindowsY * nWindowsZ;
+    localValues = zeros(totalWindows, 1);
+    parfor idx = 1:totalWindows
+        [i, j, k] = ind2sub([nWindowsX, nWindowsY, nWindowsZ], idx);
+        x1 = (i-1)*stride + 1;
+        y1 = (j-1)*stride + 1;
+        z1 = (k-1)*stride + 1;
+        x2 = min(x1+windowSize-1, nx);
+        y2 = min(y1+windowSize-1, ny);
+        z2 = min(z1+windowSize-1, nz);
+
+        window = binaryModel(x1:x2, y1:y2, z1:z2);
+        localValues(idx) = mean(window(:));
     end
+    localPorosity = reshape(localValues, [nWindowsX, nWindowsY, nWindowsZ]);
     
     % 计算梯度幅值
     [gx, gy, gz] = gradient(localPorosity);
@@ -642,27 +706,29 @@ function connectivity = computeConnectivityMetrics(binaryModel)
     eulerNumbers = zeros(3, 1);
     
     % X方向切片
-    eulerSum = 0;
     nSlices = min(10, nx); % 限制计算量
-    for i = round(linspace(1, nx, nSlices))
-        eulerSum = eulerSum + bweuler(squeeze(binaryModel(i,:,:)), 8);
+    xSliceIdx = round(linspace(1, nx, nSlices));
+    xEuler = zeros(numel(xSliceIdx), 1);
+    parfor idx = 1:numel(xSliceIdx)
+        xEuler(idx) = bweuler(squeeze(binaryModel(xSliceIdx(idx),:,:)), 8);
     end
-    eulerNumbers(1) = eulerSum / nSlices;
-    
+    eulerNumbers(1) = mean(xEuler);
+
     % Y方向切片
-    eulerSum = 0;
     nSlices = min(10, ny);
-    for i = round(linspace(1, ny, nSlices))
-        eulerSum = eulerSum + bweuler(squeeze(binaryModel(:,i,:)), 8);
+    ySliceIdx = round(linspace(1, ny, nSlices));
+    yEuler = zeros(numel(ySliceIdx), 1);
+    parfor idx = 1:numel(ySliceIdx)
+        yEuler(idx) = bweuler(squeeze(binaryModel(:,ySliceIdx(idx),:)), 8);
     end
-    eulerNumbers(2) = eulerSum / nSlices;
-    
+    eulerNumbers(2) = mean(yEuler);
+
     % Z方向切片
-    eulerSum = 0;
-    for i = 1:nz
-        eulerSum = eulerSum + bweuler(squeeze(binaryModel(:,:,i)), 8);
+    zEuler = zeros(nz, 1);
+    parfor i = 1:nz
+        zEuler(i) = bweuler(squeeze(binaryModel(:,:,i)), 8);
     end
-    eulerNumbers(3) = eulerSum / nz;
+    eulerNumbers(3) = mean(zEuler);
     
     connectivity.eulerNumber = mean(eulerNumbers);
     
@@ -697,29 +763,32 @@ function tortuosity = estimateTortuosity(binaryModel)
     [nx, ny, nz] = size(binaryModel);
     
     % 在Z方向计算迂曲度
-    tortuosity = 0;
-    validPaths = 0;
     nSamples = min(10, nx*ny/100); % 限制采样数
-    
-    for s = 1:nSamples
+    nSamples = max(1, nSamples);
+
+    tortuosityValues = zeros(nSamples, 1);
+    validMask = false(nSamples, 1);
+
+    parfor s = 1:nSamples
         % 随机选择起点
         startX = randi(nx);
         startY = randi(ny);
-        
+
         % 检查是否存在从顶部到底部的路径
         if binaryModel(startX, startY, 1) && binaryModel(startX, startY, nz)
             % 简化：使用直线距离比
             pathLength = nz;
             straightDistance = nz - 1;
             if straightDistance > 0
-                tortuosity = tortuosity + pathLength / straightDistance;
-                validPaths = validPaths + 1;
+                tortuosityValues(s) = pathLength / straightDistance;
+                validMask(s) = true;
             end
         end
     end
-    
+
+    validPaths = nnz(validMask);
     if validPaths > 0
-        tortuosity = tortuosity / validPaths;
+        tortuosity = sum(tortuosityValues(validMask)) / validPaths;
     else
         tortuosity = 1.5; % 默认值
     end
@@ -743,13 +812,15 @@ function autocorr = computeSpatialAutocorrelation(binaryModel)
     nSamples = min([totalElements, 1000, baseSamples]);
     nSamples = max(1, nSamples);
     sampleIdx = randperm(totalElements, nSamples);
-    sumNum = 0;
     sumDenom = sum(deviation(:).^2);
-    nPairs = 0;
     distanceScales = [1, 5, 10, 20, 30, 40, 50];
     offsets = [1, 0, 0; -1, 0, 0; 0, 1, 0; 0, -1, 0; 0, 0, 1; 0, 0, -1];
-    for i = 1:nSamples
-        [x, y, z] = ind2sub(size(data), sampleIdx(i));
+    contributions = zeros(nSamples, 1);
+    pairCounts = zeros(nSamples, 1);
+    parfor idx = 1:nSamples
+        [x, y, z] = ind2sub(size(data), sampleIdx(idx));
+        localSum = 0;
+        localPairs = 0;
         for d = 1:length(distanceScales)
             scale = distanceScales(d);
             for n = 1:size(offsets, 1)
@@ -759,12 +830,16 @@ function autocorr = computeSpatialAutocorrelation(binaryModel)
                 if nx >= 1 && nx <= size(data,1) && ...
                         ny >= 1 && ny <= size(data,2) && ...
                         nz >= 1 && nz <= size(data,3)
-                    sumNum = sumNum + deviation(x,y,z) * deviation(nx,ny,nz);
-                    nPairs = nPairs + 1;
+                    localSum = localSum + deviation(x,y,z) * deviation(nx,ny,nz);
+                    localPairs = localPairs + 1;
                 end
             end
         end
+        contributions(idx) = localSum;
+        pairCounts(idx) = localPairs;
     end
+    sumNum = sum(contributions);
+    nPairs = sum(pairCounts);
     if nPairs > 0 && sumDenom > 0
         autocorr = (sumNum / nPairs) / (sumDenom / numel(data));
     else
@@ -833,9 +908,9 @@ function lengths = extractChordLengthsFromLines(lines)
     % 从多条线段中提取连续孔隙段的长度
     nLines = size(lines, 2);
     lengthCells = cell(nLines, 1);
-    totalCount = 0;
+    counts = zeros(nLines, 1);
 
-    for idx = 1:nLines
+    parfor idx = 1:nLines
         line = lines(:, idx);
         if any(line)
             d = diff([0; double(line(:)); 0]);
@@ -843,9 +918,14 @@ function lengths = extractChordLengthsFromLines(lines)
             ends = find(d == -1) - 1;
             segLengths = ends - starts + 1;
             lengthCells{idx} = segLengths;
-            totalCount = totalCount + numel(segLengths);
+            counts(idx) = numel(segLengths);
+        else
+            lengthCells{idx} = [];
+            counts(idx) = 0;
         end
     end
+
+    totalCount = sum(counts);
 
     if totalCount == 0
         lengths = [];
@@ -915,20 +995,23 @@ function minkowski = computeMinkowskiFunctionals(binaryModel)
     edgeOffsets = [1, 1, 0; 1, -1, 0; 1, 0, 1; 1, 0, -1; 0, 1, 1; 0, 1, -1];
     vertexOffsets = [1, 1, 1; 1, 1, -1; 1, -1, 1; 1, -1, -1];
 
-    n2 = 0;
-    for i = 1:size(faceOffsets, 1)
-        n2 = n2 + countOffsetPairs(poreSpace, faceOffsets(i, :));
+    faceCounts = zeros(size(faceOffsets, 1), 1);
+    parfor i = 1:size(faceOffsets, 1)
+        faceCounts(i) = countOffsetPairs(poreSpace, faceOffsets(i, :));
     end
+    n2 = sum(faceCounts);
 
-    n1 = 0;
-    for i = 1:size(edgeOffsets, 1)
-        n1 = n1 + countOffsetPairs(poreSpace, edgeOffsets(i, :));
+    edgeCounts = zeros(size(edgeOffsets, 1), 1);
+    parfor i = 1:size(edgeOffsets, 1)
+        edgeCounts(i) = countOffsetPairs(poreSpace, edgeOffsets(i, :));
     end
+    n1 = sum(edgeCounts);
 
-    n0 = 0;
-    for i = 1:size(vertexOffsets, 1)
-        n0 = n0 + countOffsetPairs(poreSpace, vertexOffsets(i, :));
+    vertexCounts = zeros(size(vertexOffsets, 1), 1);
+    parfor i = 1:size(vertexOffsets, 1)
+        vertexCounts(i) = countOffsetPairs(poreSpace, vertexOffsets(i, :));
     end
+    n0 = sum(vertexCounts);
 
     surfaceArea = 6 * n3 - 2 * n2;
     meanBreadth = 3 * n3 - 2 * n2 + n1;
@@ -994,7 +1077,7 @@ function values = computeLinealPathAlongAxis(volume, axis, distances)
     nLines = size(lines, 2);
 
     values = nan(length(distances), 1);
-    for idx = 1:length(distances)
+    parfor idx = 1:length(distances)
         r = distances(idx);
         if r <= 0 || r > len
             values(idx) = NaN;
