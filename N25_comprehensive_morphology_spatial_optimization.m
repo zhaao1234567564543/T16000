@@ -1701,14 +1701,30 @@ function model = matchPoreSizeDistribution(model, originalFeatures, optParams)
             expanded = imdilate(model, se);
             addMask = expanded & ~model;
             prob = min(0.5, diffVal * 5);
-            randField = rand(size(model));
-            model(addMask & randField(addMask) < prob) = true;
+            if prob > 0 && any(addMask(:))
+                addIdx = find(addMask);
+                randVals = rand(numel(addIdx), 1);
+                chosen = addIdx(randVals < prob);
+                if ~isempty(chosen)
+                    selectionMask = false(size(model));
+                    selectionMask(chosen) = true;
+                    model(selectionMask) = true;
+                end
+            end
         else
             eroded = imerode(model, se);
             removeMask = model & ~eroded;
             prob = min(0.5, -diffVal * 5);
-            randField = rand(size(model));
-            model(removeMask & randField(removeMask) < prob) = false;
+            if prob > 0 && any(removeMask(:))
+                removeIdx = find(removeMask);
+                randVals = rand(numel(removeIdx), 1);
+                chosen = removeIdx(randVals < prob);
+                if ~isempty(chosen)
+                    selectionMask = false(size(model));
+                    selectionMask(chosen) = true;
+                    model(selectionMask) = false;
+                end
+            end
         end
     end
     if nargin >= 3 && isfield(optParams, 'targetPorosity')
