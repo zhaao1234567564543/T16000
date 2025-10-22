@@ -1489,13 +1489,17 @@ function model = reinforceDensityTargets(model, densityMap, targetPorosity)
     removalChance = 0.45 - 0.4 * normalized;
     removalChance = max(0.05, min(0.9, removalChance));
     randField = rand(size(model));
-    model(removalMask & randField(removalMask) < removalChance(removalMask)) = false;
+    removalSelection = false(size(model));
+    removalSelection(removalMask) = randField(removalMask) < removalChance(removalMask);
+    model(removalSelection) = false;
 
     additionMask = desiredMask & ~model;
     additionChance = 0.35 + 0.5 * normalized;
     additionChance = max(0.05, min(0.95, additionChance));
     randField = rand(size(model));
-    model(additionMask & randField(additionMask) < additionChance(additionMask)) = true;
+    additionSelection = false(size(model));
+    additionSelection(additionMask) = randField(additionMask) < additionChance(additionMask);
+    model(additionSelection) = true;
 end
 function match = calculateMultiScaleMatch(currentMultiScale, targetMultiScale)
     % 计算多尺度特征匹配度
