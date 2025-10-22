@@ -1588,14 +1588,42 @@ function model = applyMultiScaleCorrection(model, currentMultiScale, targetMulti
             candidate = imdilate(corrected, se);
             addMask = candidate & ~corrected;
             prob = min(0.6, diffVal * 8);
-            randField = rand(size(corrected));
-            corrected(addMask & randField(addMask) < prob) = true;
+            if prob <= 0
+                continue;
+            end
+            addIdx = find(addMask);
+            if isempty(addIdx)
+                continue;
+            end
+            if prob >= 1
+                selectedIdx = addIdx;
+            else
+                selection = rand(numel(addIdx), 1) < prob;
+                selectedIdx = addIdx(selection);
+            end
+            if ~isempty(selectedIdx)
+                corrected(selectedIdx) = true;
+            end
         else
             candidate = imerode(corrected, se);
             removeMask = corrected & ~candidate;
             prob = min(0.6, -diffVal * 8);
-            randField = rand(size(corrected));
-            corrected(removeMask & randField(removeMask) < prob) = false;
+            if prob <= 0
+                continue;
+            end
+            removeIdx = find(removeMask);
+            if isempty(removeIdx)
+                continue;
+            end
+            if prob >= 1
+                selectedIdx = removeIdx;
+            else
+                selection = rand(numel(removeIdx), 1) < prob;
+                selectedIdx = removeIdx(selection);
+            end
+            if ~isempty(selectedIdx)
+                corrected(selectedIdx) = false;
+            end
         end
     end
     model = corrected;
