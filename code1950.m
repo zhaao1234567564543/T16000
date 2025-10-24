@@ -426,69 +426,40 @@ function morphologyFeatures = computeDetailedMorphologyFeatures(binaryModel)
     analyzeIdx = sortIdx(1:nAnalyze);
     
     % 初始化特征数组
-    morphologyFeatures.elongation = zeros(nAnalyze, 1);
-    morphologyFeatures.sphericity = zeros(nAnalyze, 1);
-    morphologyFeatures.convexity = zeros(nAnalyze, 1);
-    morphologyFeatures.solidity = zeros(nAnalyze, 1);
-    
-    % 计算每个簇的形态特征
-    for i = 1:nAnalyze
-        idx = analyzeIdx(i);
-        [x, y, z] = ind2sub(size(binaryModel), CC.PixelIdxList{idx});
-        
-        if length(x) > 10 % 只对足够大的簇计算
-            % 主成分分析
-            coords = [x - mean(x), y - mean(y), z - mean(z)];
-            try
-                [V, D] = eig(cov(coords));
-                eigenvalues = diag(D);
-                eigenvalues = sort(eigenvalues, 'descend');
-                
-                % 伸长率
-                if eigenvalues(3) > 0
-                    morphologyFeatures.elongation(i) = sqrt(eigenvalues(1) / eigenvalues(3));
-                else
-                    morphologyFeatures.elongation(i) = 1;
-                end
-                
-                % 球形度（简化计算）
-                volume = length(x);
-                % 使用椭球体近似
-                a = sqrt(eigenvalues(1));
-                b = sqrt(eigenvalues(2));
-                c = sqrt(eigenvalues(3));
-                if a > 0 && b > 0 && c > 0
-                    ellipsoidVolume = (4/3) * pi * a * b * c;
-                    morphologyFeatures.sphericity(i) = (volume / ellipsoidVolume)^(1/3);
-                else
-                    morphologyFeatures.sphericity(i) = 0.5;
-                end
-                
-                % 凸性
-                rangeX = max(x) - min(x) + 1;
-                rangeY = max(y) - min(y) + 1;
-                rangeZ = max(z) - min(z) + 1;
-                boundingBoxVolume = rangeX * rangeY * rangeZ;
-                morphologyFeatures.convexity(i) = volume / boundingBoxVolume;
-                
-                % 实心度
-                morphologyFeatures.solidity(i) = morphologyFeatures.convexity(i);
-                
-            catch
-                % 如果PCA失败，使用默认值
-                morphologyFeatures.elongation(i) = 1;
-                morphologyFeatures.sphericity(i) = 0.5;
-                morphologyFeatures.convexity(i) = 0.5;
-                morphologyFeatures.solidity(i) = 0.5;
-            end
-        else
-            % 小簇使用默认值
-            morphologyFeatures.elongation(i) = 1;
-            morphologyFeatures.sphericity(i) = 0.8;
-            morphologyFeatures.convexity(i) = 0.8;
-            morphologyFeatures.solidity(i) = 0.8;
+    elongation = zeros(nAnalyze, 1);
+    sphericity = zeros(nAnalyze, 1);
+    convexity = zeros(nAnalyze, 1);
+    solidity = zeros(nAnalyze, 1);
+    modelSize = size(binaryModel);
+
+    useParallel = shouldUseParallel(nAnalyze, numel(binaryModel));
+
+    if useParallel && nAnalyze > 1
+        parfor i = 1:nAnalyze
+            clusterIdx = analyzeIdx(i);
+            pixelIdx = CC.PixelIdxList{clusterIdx};
+            [elong, spher, convx, solid] = computeClusterMorphologyMetrics(pixelIdx, modelSize);
+            elongation(i) = elong;
+            sphericity(i) = spher;
+            convexity(i) = convx;
+            solidity(i) = solid;
+        end
+    else
+        for i = 1:nAnalyze
+            clusterIdx = analyzeIdx(i);
+            pixelIdx = CC.PixelIdxList{clusterIdx};
+            [elong, spher, convx, solid] = computeClusterMorphologyMetrics(pixelIdx, modelSize);
+            elongation(i) = elong;
+            sphericity(i) = spher;
+            convexity(i) = convx;
+            solidity(i) = solid;
         end
     end
+
+    morphologyFeatures.elongation = elongation;
+    morphologyFeatures.sphericity = sphericity;
+    morphologyFeatures.convexity = convexity;
+    morphologyFeatures.solidity = solidity;
     
     % 计算网络特征
     morphologyFeatures.poreNetworkDensity = computePoreNetworkDensity(binaryModel);
@@ -498,6 +469,67 @@ function morphologyFeatures = computeDetailedMorphologyFeatures(binaryModel)
     morphologyFeatures.lacunarity = computeLacunarity(binaryModel);
     morphologyFeatures.textureFeatures = computeTextureFeatures(binaryModel);
     morphologyFeatures.skeletonFeatures = computeSkeletonFeatures(binaryModel);
+end
+function [elongation, sphericity, convexity, solidity] = ...
+    computeClusterMorphologyMetrics(pixelIdx, modelSize)
+    % 计算单个簇的核心形态指标
+    [x, y, z] = ind2sub(modelSize, pixelIdx);
+    nVoxels = numel(x);
+
+    if nVoxels <= 10
+        elongation = 1;
+        sphericity = 0.8;
+        convexity = 0.8;
+        solidity = 0.8;
+        return;
+    end
+
+    coords = [double(x) - mean(x), double(y) - mean(y), double(z) - mean(z)];
+
+    elongation = 1;
+    sphericity = 0.5;
+    convexity = 0.5;
+    solidity = 0.5;
+
+    try
+        C = cov(coords);
+        if any(isnan(C(:)))
+            C = eye(3);
+        end
+        eigenvalues = eig(C);
+        eigenvalues = sort(max(eigenvalues, eps), 'descend');
+        if numel(eigenvalues) < 3
+            eigenvalues(3) = eigenvalues(end);
+        end
+    catch
+        eigenvalues = [1; 1; 1];
+    end
+
+    elongation = sqrt(eigenvalues(1) / max(eigenvalues(3), eps));
+
+    volume = nVoxels;
+    a = sqrt(eigenvalues(1));
+    b = sqrt(eigenvalues(2));
+    c = sqrt(eigenvalues(3));
+    ellipsoidVolume = (4/3) * pi * a * b * c;
+    if ellipsoidVolume > 0
+        sphericity = min(1, max(0, (volume / ellipsoidVolume)^(1/3)));
+    else
+        sphericity = 0.5;
+    end
+
+    rangeX = double(max(x) - min(x) + 1);
+    rangeY = double(max(y) - min(y) + 1);
+    rangeZ = double(max(z) - min(z) + 1);
+    boundingBoxVolume = rangeX * rangeY * rangeZ;
+
+    if boundingBoxVolume > 0
+        convexity = min(1, volume / boundingBoxVolume);
+    else
+        convexity = 1;
+    end
+
+    solidity = convexity;
 end
 function morphologyFeatures = createEmptyMorphologyFeatures()
     % 创建空的形态学特征结构
@@ -1468,57 +1500,16 @@ function lookupTables = generateComprehensiveLookupTables(binaryModel, ...
 end
 function localPorosityMap = computeLocalPorosityMap(binaryModel, windowSize)
     % 计算局部孔隙率图
-    [nx, ny, nz] = size(binaryModel);
-    localPorosityMap = zeros(nx, ny, nz);
-    halfSize = floor(windowSize/2);
-    
-    % 使用积分图像加速
-    integralImage = cumsum(cumsum(cumsum(double(binaryModel), 1), 2), 3);
-    
-    for x = 1:nx
-        for y = 1:ny
-            for z = 1:nz
-                % 定义窗口边界
-                x1 = max(1, x - halfSize);
-                x2 = min(nx, x + halfSize);
-                y1 = max(1, y - halfSize);
-                y2 = min(ny, y + halfSize);
-                z1 = max(1, z - halfSize);
-                z2 = min(nz, z + halfSize);
-                
-                % 使用积分图像快速计算
-                windowSum = getBoxSum(integralImage, x1, y1, z1, x2, y2, z2);
-                windowSize = (x2-x1+1) * (y2-y1+1) * (z2-z1+1);
-                localPorosityMap(x, y, z) = windowSum / windowSize;
-            end
-        end
-    end
-end
-function boxSum = getBoxSum(integralImage, x1, y1, z1, x2, y2, z2)
-    % 使用积分图像计算盒子和
-    boxSum = integralImage(x2, y2, z2);
-    
-    if x1 > 1
-        boxSum = boxSum - integralImage(x1-1, y2, z2);
-    end
-    if y1 > 1
-        boxSum = boxSum - integralImage(x2, y1-1, z2);
-    end
-    if z1 > 1
-        boxSum = boxSum - integralImage(x2, y2, z1-1);
-    end
-    if x1 > 1 && y1 > 1
-        boxSum = boxSum + integralImage(x1-1, y1-1, z2);
-    end
-    if x1 > 1 && z1 > 1
-        boxSum = boxSum + integralImage(x1-1, y2, z1-1);
-    end
-    if y1 > 1 && z1 > 1
-        boxSum = boxSum + integralImage(x2, y1-1, z1-1);
-    end
-    if x1 > 1 && y1 > 1 && z1 > 1
-        boxSum = boxSum - integralImage(x1-1, y1-1, z1-1);
-    end
+    % 使用卷积在CPU上实现高度向量化的滑窗平均，显著提升性能
+    kernel = ones(windowSize, windowSize, windowSize, 'double');
+
+    % 计算每个位置周围的孔隙体素数量
+    localSum = convn(double(binaryModel), kernel, 'same');
+
+    % 计算边界处有效的体素数量，避免零填充造成偏差
+    validCount = convn(ones(size(binaryModel), 'double'), kernel, 'same');
+
+    localPorosityMap = localSum ./ max(validCount, 1);
 end
 function gradientField = computeSpatialGradientField(binaryModel)
     % 计算空间梯度场
@@ -4183,102 +4174,49 @@ function move = generateLocalShapeMove(model, lookupTables)
     end
 end
 function move = generateBoundarySmoothingMove(model)
-    % 生成边界平滑移动
+    % 生成边界平滑移动（向量化实现）
     move = struct();
-    
-    % 找到粗糙的边界区域
-    boundary = bwperim(model, 26);
-    [x, y, z] = ind2sub(size(model), find(boundary));
-    
-    if isempty(x)
+
+    stats = precomputeLocalMoveStatistics(model);
+    boundaryMask = stats.boundaryMask;
+    boundaryIdx = find(boundaryMask);
+
+    if isempty(boundaryIdx)
         move = generateLocalMove(model, 3);
         return;
     end
-    
-    % 计算边界粗糙度
-    roughness = zeros(length(x), 1);
-    for i = 1:length(x)
-        % 计算邻域变化
-        neighbors = 0;
-        changes = 0;
-        
-        for dx = -1:1
-            for dy = -1:1
-                for dz = -1:1
-                    if dx == 0 && dy == 0 && dz == 0
-                        continue;
-                    end
-                    
-                    nx = x(i) + dx;
-                    ny = y(i) + dy;
-                    nz = z(i) + dz;
-                    
-                    if nx >= 1 && nx <= size(model,1) && ...
-                        ny >= 1 && ny <= size(model,2) && ...
-                        nz >= 1 && nz <= size(model,3)
-                        neighbors = neighbors + 1;
-                        if model(nx, ny, nz) ~= model(x(i), y(i), z(i))
-                            changes = changes + 1;
-                        end
-                    end
-                end
-            end
-        end
-        
-        if neighbors > 0
-            roughness(i) = changes / neighbors;
-        end
+
+    neighborCount = double(stats.neighborCount6(boundaryMask));
+    neighborSum = double(stats.neighborSum6(boundaryMask));
+    centerValues = model(boundaryIdx);
+
+    diffCounts = neighborSum;
+    if any(centerValues)
+        filledMask = centerValues;
+        diffCounts(filledMask) = neighborCount(filledMask) - neighborSum(filledMask);
     end
-    
-    % 选择最粗糙的点进行平滑
-    [~, roughIdx] = sort(roughness, 'descend');
-    nSmooth = min(5, length(roughIdx));
-    
-    move.linearIdx = [];
-    move.oldValues = [];
-    move.newValues = [];
-    
-    for i = 1:nSmooth
-        idx = sub2ind(size(model), x(roughIdx(i)), y(roughIdx(i)), z(roughIdx(i)));
-        
-        % 根据邻域多数决定
-        neighborSum = 0;
-        neighborCount = 0;
-        
-        for dx = -1:1
-            for dy = -1:1
-                for dz = -1:1
-                    if dx == 0 && dy == 0 && dz == 0
-                        continue;
-                    end
-                    
-                    nx = x(roughIdx(i)) + dx;
-                    ny = y(roughIdx(i)) + dy;
-                    nz = z(roughIdx(i)) + dz;
-                    
-                    if nx >= 1 && nx <= size(model,1) && ...
-                        ny >= 1 && ny <= size(model,2) && ...
-                        nz >= 1 && nz <= size(model,3)
-                        neighborSum = neighborSum + model(nx, ny, nz);
-                        neighborCount = neighborCount + 1;
-                    end
-                end
-            end
-        end
-        
-        if neighborCount > 0
-            majorityValue = neighborSum > neighborCount/2;
-            if model(idx) ~= majorityValue
-                move.linearIdx = [move.linearIdx; idx];
-                move.oldValues = [move.oldValues; model(idx)];
-                move.newValues = [move.newValues; majorityValue];
-            end
-        end
-    end
-    
-    if isempty(move.linearIdx)
+
+    roughness = diffCounts ./ max(neighborCount, 1);
+    nSmooth = min(5, numel(boundaryIdx));
+    [~, order] = sort(roughness, 'descend');
+    selected = order(1:nSmooth);
+
+    candidateIdx = boundaryIdx(selected);
+    majorityValues = neighborSum(selected) >= (neighborCount(selected) / 2);
+    oldValues = centerValues(selected);
+    changeMask = oldValues ~= majorityValues;
+
+    if ~any(changeMask)
         move = generateLocalMove(model, 3);
+        return;
     end
+
+    move.linearIdx = candidateIdx(changeMask);
+    move.oldValues = oldValues(changeMask);
+    move.newValues = majorityValues(changeMask);
+
+    move.oldValues = move.oldValues(:);
+    move.newValues = move.newValues(:);
 end
 function move = generateClusterShapeMove(model, optParams)
     % 生成簇形状调整移动
@@ -4946,24 +4884,29 @@ function deltaEnergies = evaluateComprehensiveBatchMoves(mcmcState, moves, ...
         parallelEnabled = shouldUseParallel(nMoves, numel(mcmcState.model));
     end
 
+    localStats = precomputeLocalMoveStatistics(mcmcState.model);
+
     if parallelEnabled && nMoves > 1
         parfor i = 1:nMoves
             deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
-                moveTypes{i}, lookupTables, phase, i);
+                moveTypes{i}, lookupTables, phase, i, localStats);
         end
     else
         for i = 1:nMoves
             deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
-                moveTypes{i}, lookupTables, phase, i);
+                moveTypes{i}, lookupTables, phase, i, localStats);
         end
     end
 end
 function deltaE = safeEvaluateComprehensiveMove(mcmcState, move, moveType, ...
-    lookupTables, phase, moveIndex)
+    lookupTables, phase, moveIndex, localStats)
     % 并行安全的能量评估包装器
+    if nargin < 7
+        localStats = [];
+    end
     try
         deltaE = evaluateComprehensiveMoveDelta(mcmcState, move, moveType, ...
-            lookupTables, phase);
+            lookupTables, phase, localStats);
     catch ME
         warning('评估移动 %d 时出错: %s', moveIndex, ME.message);
         deltaE = evaluateSimpleMoveDelta(mcmcState, move);
@@ -4973,12 +4916,31 @@ function deltaE = safeEvaluateComprehensiveMove(mcmcState, move, moveType, ...
         deltaE = evaluateSimpleMoveDelta(mcmcState, move);
     end
 end
+function localStats = precomputeLocalMoveStatistics(model)
+    % 为批量能量评估预计算局部统计量
+    persistent kernel6
+
+    if isempty(kernel6)
+        kernel6 = single(zeros(3, 3, 3));
+        kernel6(2, 2, 1) = 1;
+        kernel6(2, 2, 3) = 1;
+        kernel6(2, 1, 2) = 1;
+        kernel6(2, 3, 2) = 1;
+        kernel6(1, 2, 2) = 1;
+        kernel6(3, 2, 2) = 1;
+    end
+
+    localStats = struct();
+    localStats.boundaryMask = bwperim(model, 26);
+    localStats.neighborSum6 = convn(single(model), kernel6, 'same');
+    localStats.neighborCount6 = convn(ones(size(model), 'single'), kernel6, 'same');
+end
 function deltaE = evaluateComprehensiveMoveDelta(mcmcState, move, moveType, ...
-    lookupTables, phase)
+    lookupTables, phase, localStats)
     % 评估综合移动的能量变化
 
     % 基础能量变化
-    baseDE = evaluateBaseMoveDelta(mcmcState, move);
+    baseDE = evaluateBaseMoveDelta(mcmcState, move, localStats);
 
     % 当前特征匹配度
     targetSpatial = mcmcState.optParams.spatialFeatures;
@@ -5044,90 +5006,49 @@ function deltaE = evaluateComprehensiveMoveDelta(mcmcState, move, moveType, ...
     % 添加随机扰动避免局部最优
     deltaE = deltaE * (0.98 + 0.04 * randn());
 end
-function deltaE = evaluateBaseMoveDelta(mcmcState, move)
+function deltaE = evaluateBaseMoveDelta(mcmcState, move, localStats)
     % 评估基础移动能量变化
     if isempty(move.linearIdx)
         deltaE = 0;
         return;
     end
-    
+
+    if nargin < 3 || isempty(localStats)
+        localStats = precomputeLocalMoveStatistics(mcmcState.model);
+    end
+
     % 快速估计能量变化
-    nChanged = length(move.linearIdx);
-    nFlipped = sum(move.newValues) - sum(move.oldValues);
-    
+    idx = move.linearIdx(:);
+    nChanged = numel(idx);
+    modelSize = numel(mcmcState.model);
+
+    newValues = logical(move.newValues(:));
+    oldValues = logical(move.oldValues(:));
+
     % 孔隙率变化
-    deltaPorosity = nFlipped / numel(mcmcState.model);
-    porosityDiff = abs(deltaPorosity);
+    nFlipped = sum(newValues) - sum(oldValues);
+    deltaPorosity = nFlipped / modelSize;
     targetPorosity = mcmcState.optParams.targetPorosity;
     currentPorosity = mean(mcmcState.model(:));
-    
-    % 如果变化会使孔隙率偏离目标，增加惩罚
     newPorosity = currentPorosity + deltaPorosity;
     currentError = abs(currentPorosity - targetPorosity);
     newError = abs(newPorosity - targetPorosity);
-    
     deltaE_porosity = (newError - currentError) * mcmcState.weights.porosity;
-    
-    % 表面积变化估计
-    boundary = bwperim(mcmcState.model, 26);
-    boundaryVec = boundary(:);
-    
-    % 创建标记向量
-    changeMarker = false(numel(mcmcState.model), 1);
-    changeMarker(move.linearIdx) = true;
-    
-    % 计算边界上的变化数量
-    boundaryChange = sum(boundaryVec & changeMarker);
-    
-    % 估计表面积变化
-    surfaceChangeEstimate = 0;
-    for i = 1:length(move.linearIdx)
-        idx = move.linearIdx(i);
-        if boundaryVec(idx)
-            % 边界体素
-            if move.newValues(i)
-                surfaceChangeEstimate = surfaceChangeEstimate - 1; % 填充边界减少表面
-            else
-                surfaceChangeEstimate = surfaceChangeEstimate + 1; % 移除边界增加表面
-            end
-        else
-            % 内部体素，检查是否会创建新边界
-            [x, y, z] = ind2sub(size(mcmcState.model), idx);
-            neighborCount = 0;
-            
-            % 检查6邻域
-            for dx = [-1, 1]
-                nx = x + dx;
-                if nx >= 1 && nx <= size(mcmcState.model, 1)
-                    neighborCount = neighborCount + mcmcState.model(nx, y, z);
-                end
-            end
-            
-            for dy = [-1, 1]
-                ny = y + dy;
-                if ny >= 1 && ny <= size(mcmcState.model, 2)
-                    neighborCount = neighborCount + mcmcState.model(x, ny, z);
-                end
-            end
-            
-            for dz = [-1, 1]
-                nz = z + dz;
-                if nz >= 1 && nz <= size(mcmcState.model, 3)
-                    neighborCount = neighborCount + mcmcState.model(x, y, nz);
-                end
-            end
-            
-            % 如果翻转会创建新边界
-            if move.newValues(i) && neighborCount < 6
-                surfaceChangeEstimate = surfaceChangeEstimate + 0.5;
-            elseif ~move.newValues(i) && neighborCount > 0
-                surfaceChangeEstimate = surfaceChangeEstimate + 0.5;
-            end
-        end
-    end
-    
-    deltaE_surface = abs(surfaceChangeEstimate) / numel(mcmcState.model) * mcmcState.weights.morphology;
-    
+
+    % 利用预计算的局部统计量估计表面积变化
+    neighborCount = double(localStats.neighborCount6(idx));
+    neighborSum = double(localStats.neighborSum6(idx));
+    currentValues = double(mcmcState.model(idx));
+
+    currentMismatched = currentValues .* (neighborCount - neighborSum) + ...
+        (1 - currentValues) .* neighborSum;
+    newMismatched = double(newValues) .* (neighborCount - neighborSum) + ...
+        double(~newValues) .* neighborSum;
+    surfaceChangeEstimate = sum(newMismatched - currentMismatched);
+    normalization = max(1, sum(neighborCount));
+    surfaceRatio = surfaceChangeEstimate / normalization;
+    deltaE_surface = surfaceRatio * mcmcState.weights.morphology;
+
     % 簇大小变化的粗略估计
     clusterImpact = 0;
     if nChanged > 20
@@ -5135,21 +5056,19 @@ function deltaE = evaluateBaseMoveDelta(mcmcState, move)
     elseif nChanged > 10
         clusterImpact = 0.05;
     end
-    
     deltaE_cluster = clusterImpact * mcmcState.weights.cluster;
-    
-    % 空间相关性影响
-    if length(move.linearIdx) > 1
-        [xs, ys, zs] = ind2sub(size(mcmcState.model), move.linearIdx);
+
+    % 空间相关性影响（保持与旧版本一致的启发式）
+    if nChanged > 1
+        [xs, ys, zs] = ind2sub(size(mcmcState.model), idx);
         spatialSpread = std(xs) + std(ys) + std(zs);
-        normalizedSpread = spatialSpread / (size(mcmcState.model, 1) + size(mcmcState.model, 2) + size(mcmcState.model, 3));
-        
-        % 集中的移动更好
+        normalizedSpread = spatialSpread / (size(mcmcState.model, 1) + ...
+            size(mcmcState.model, 2) + size(mcmcState.model, 3));
         deltaE_spatial = normalizedSpread * mcmcState.weights.spatial * 0.1;
     else
         deltaE_spatial = 0;
     end
-    
+
     % 总能量变化
     deltaE = deltaE_porosity + deltaE_surface + deltaE_cluster + deltaE_spatial;
 end
@@ -6667,9 +6586,20 @@ function useParallel = shouldUseParallel(batchSize, problemSize)
     end
 
     try
+        % 避免在并行工作线程中递归启动并行
+        currentTask = [];
+        try
+            currentTask = getCurrentTask();
+        catch
+            currentTask = [];
+        end
+        if ~isempty(currentTask)
+            return;
+        end
+
         pool = gcp('nocreate');
         if isempty(pool)
-            if batchSize >= 8 && problemSize >= 2e5
+            if batchSize >= 4 && problemSize >= 1e5
                 try
                     pool = parpool('threads');
                 catch
