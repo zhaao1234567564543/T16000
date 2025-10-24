@@ -2423,61 +2423,170 @@ function model = adjustClusterSizeDistribution(model, optParams)
     % 处理极端大小的簇
     maxAllowed = optParams.targetMax * 3;
     minAllowed = max(5, optParams.targetMin / 10);
+    volumeSize = size(model);
+
     % 缩减过大的簇
     largeClusters = find(sizes > maxAllowed);
-    for i = 1:length(largeClusters)
-        idx = largeClusters(i);
-        fprintf('    调整大簇尺寸 (大小=%d)...\n', sizes(idx));
-        model = reduceOversizedCluster(model, CC.PixelIdxList{idx}, optParams);
+    if ~isempty(largeClusters)
+        targetSize = max(1, optParams.targetMax);
+        origPixelLists = CC.PixelIdxList(largeClusters);
+        refinedPixelLists = cell(numel(largeClusters), 1);
+        useParallel = shouldUseParallel(numel(largeClusters), numel(model));
+        if useParallel
+            parfor i = 1:numel(largeClusters)
+                refinedPixelLists{i} = reduceOversizedClusterIndices( ...
+                    origPixelLists{i}, volumeSize, targetSize);
+            end
+        else
+            for i = 1:numel(largeClusters)
+                refinedPixelLists{i} = reduceOversizedClusterIndices( ...
+                    origPixelLists{i}, volumeSize, targetSize);
+            end
+        end
+
+        originalSizes = cellfun(@numel, origPixelLists);
+        refinedSizes = cellfun(@numel, refinedPixelLists);
+        reductionRates = 1 - refinedSizes ./ max(originalSizes, 1);
+        reductionRates(~isfinite(reductionRates)) = 0;
+        avgReduction = mean(reductionRates);
+        fprintf('    批量调整%d个大簇尺寸 (平均缩减率%.1f%%) ...\n', ...
+            numel(largeClusters), avgReduction * 100);
+
+        for i = 1:numel(largeClusters)
+            model(origPixelLists{i}) = false;
+        end
+        for i = 1:numel(largeClusters)
+            model(refinedPixelLists{i}) = true;
+        end
     end
+
     % 处理过小的簇
     tinyClusters = find(sizes < minAllowed);
     if ~isempty(tinyClusters)
         fprintf('    移除或扩展%d个过小的簇...\n', length(tinyClusters));
-        for i = 1:length(tinyClusters)
-            clusterIdx = tinyClusters(i);
-            if isfield(optParams, 'preserveSmallPores') && optParams.preserveSmallPores
-                model = growSmallCluster(model, CC.PixelIdxList{clusterIdx});
+        pixelLists = CC.PixelIdxList(tinyClusters);
+        if isfield(optParams, 'preserveSmallPores') && optParams.preserveSmallPores
+            grownPixelLists = cell(numel(tinyClusters), 1);
+            useParallel = shouldUseParallel(numel(tinyClusters), numel(model));
+            if useParallel
+                parfor i = 1:numel(tinyClusters)
+                    grownPixelLists{i} = growSmallClusterIndices( ...
+                        pixelLists{i}, volumeSize);
+                end
             else
-                model(CC.PixelIdxList{clusterIdx}) = false;
+                for i = 1:numel(tinyClusters)
+                    grownPixelLists{i} = growSmallClusterIndices( ...
+                        pixelLists{i}, volumeSize);
+                end
             end
+
+            for i = 1:numel(tinyClusters)
+                model(pixelLists{i}) = false;
+            end
+            for i = 1:numel(tinyClusters)
+                model(grownPixelLists{i}) = true;
+            end
+        else
+            flatIdx = cellfun(@(idx) idx(:), pixelLists, 'UniformOutput', false);
+            flatIdx = vertcat(flatIdx{:});
+            model(flatIdx) = false;
         end
     end
 end
-function model = reduceOversizedCluster(model, clusterIdx, optParams)
-    % 通过平滑收缩的方式减少大簇体量
-    clusterMask = false(size(model));
-    clusterMask(clusterIdx) = true;
+function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targetSize)
+    % 计算缩减后的簇索引
     currentSize = numel(clusterIdx);
-    targetSize = max(1, optParams.targetMax);
     if currentSize <= targetSize
+        refinedIdx = clusterIdx;
         return;
     end
-    distMap = bwdist(~clusterMask);
+
+    pad = 2;
+    [x, y, z] = ind2sub(volumeSize, clusterIdx);
+    minX = max(min(x) - pad, 1);
+    maxX = min(max(x) + pad, volumeSize(1));
+    minY = max(min(y) - pad, 1);
+    maxY = min(max(y) + pad, volumeSize(2));
+    minZ = max(min(z) - pad, 1);
+    maxZ = min(max(z) + pad, volumeSize(3));
+
+    localSize = [maxX - minX + 1, maxY - minY + 1, maxZ - minZ + 1];
+    localMask = false(localSize);
+    localX = x - minX + 1;
+    localY = y - minY + 1;
+    localZ = z - minZ + 1;
+    localIdx = sub2ind(localSize, localX, localY, localZ);
+    localMask(localIdx) = true;
+
+    distMap = bwdist(~localMask);
     reductionRatio = min(0.45, max(0, (currentSize - targetSize) / currentSize));
-    distances = distMap(clusterMask);
-    cutoff = quantile(distances, reductionRatio);
-    removalMask = clusterMask & (distMap <= cutoff);
-    refined = clusterMask;
-    refined(removalMask) = false;
-    % 轻度平滑以保持连通性
-    se = strel('sphere', 1);
-    refined = imclose(refined, se);
-    % 防止完全消失
-    if ~any(refined(:))
-        refined = clusterMask;
+    if reductionRatio <= 0
+        refinedIdx = clusterIdx;
+        return;
     end
+
+    distances = distMap(localMask);
+    if isempty(distances) || all(distances == 0)
+        refinedIdx = clusterIdx;
+        return;
+    end
+
+    cutoff = quantile(distances, reductionRatio);
+    removalMask = localMask & (distMap <= cutoff);
+    refinedLocal = localMask;
+    refinedLocal(removalMask) = false;
+
+    se = strel('sphere', 1);
+    refinedLocal = imclose(refinedLocal, se);
+    if ~any(refinedLocal(:))
+        refinedLocal = localMask;
+    end
+
+    [rx, ry, rz] = ind2sub(localSize, find(refinedLocal));
+    rx = rx + minX - 1;
+    ry = ry + minY - 1;
+    rz = rz + minZ - 1;
+    refinedIdx = sub2ind(volumeSize, rx, ry, rz);
+end
+function model = reduceOversizedCluster(model, clusterIdx, optParams)
+    % 通过平滑收缩的方式减少大簇体量
+    targetSize = max(1, optParams.targetMax);
+    refinedIdx = reduceOversizedClusterIndices(clusterIdx, size(model), targetSize);
     model(clusterIdx) = false;
-    model = model | refined;
+    model(refinedIdx) = true;
+end
+function grownIdx = growSmallClusterIndices(clusterIdx, volumeSize)
+    % 计算扩展后的小簇索引
+    pad = 1;
+    [x, y, z] = ind2sub(volumeSize, clusterIdx);
+    minX = max(min(x) - pad, 1);
+    maxX = min(max(x) + pad, volumeSize(1));
+    minY = max(min(y) - pad, 1);
+    maxY = min(max(y) + pad, volumeSize(2));
+    minZ = max(min(z) - pad, 1);
+    maxZ = min(max(z) + pad, volumeSize(3));
+
+    localSize = [maxX - minX + 1, maxY - minY + 1, maxZ - minZ + 1];
+    localMask = false(localSize);
+    localX = x - minX + 1;
+    localY = y - minY + 1;
+    localZ = z - minZ + 1;
+    localIdx = sub2ind(localSize, localX, localY, localZ);
+    localMask(localIdx) = true;
+
+    se = strel('sphere', 1);
+    grownLocal = imdilate(localMask, se);
+    [gx, gy, gz] = ind2sub(localSize, find(grownLocal));
+    gx = gx + minX - 1;
+    gy = gy + minY - 1;
+    gz = gz + minZ - 1;
+    grownIdx = sub2ind(volumeSize, gx, gy, gz);
 end
 function model = growSmallCluster(model, clusterIdx)
     % 通过局部膨胀扩展小簇，避免直接删除
-    clusterMask = false(size(model));
-    clusterMask(clusterIdx) = true;
-    se = strel('sphere', 1);
-    grown = imdilate(clusterMask, se);
+    grownIdx = growSmallClusterIndices(clusterIdx, size(model));
     model(clusterIdx) = false;
-    model = model | grown;
+    model(grownIdx) = true;
 end
 function model = applySpatialCorrection(model, currentSpatial, targetSpatial)
     % 应用空间修正
