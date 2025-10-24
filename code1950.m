@@ -107,6 +107,11 @@ mcmcModel = generateComprehensiveInitialModel(dims, target_porosity, originalFea
 %% 4. MCMC 迭代参数设置
 maxIterations = 3000; % 增加迭代次数
 batchSize = 12;
+parallelEnabled = shouldUseParallel(batchSize, numel(mcmcModel));
+if parallelEnabled
+    batchSize = max(batchSize, 24);
+    fprintf('检测到并行资源，批量移动数调整为 %d 并启用并行评估。\n', batchSize);
+end
 % 自适应能量函数权重
 weights = struct();
 weights.cluster = 6.0;
@@ -173,11 +178,11 @@ for iter = 1:maxIterations
     
     % 生成批量候选移动
     [moves, moveTypes] = generateComprehensiveBatchMoves(mcmcState.model, ...
-        moveStrategy, batchSize, optParams, lookupTables);
+        moveStrategy, batchSize, optParams, lookupTables, parallelEnabled);
     
     % 评估移动
     deltaEnergies = evaluateComprehensiveBatchMoves(mcmcState, moves, ...
-        moveTypes, lookupTables, optimization_phase);
+        moveTypes, lookupTables, optimization_phase, parallelEnabled);
     
     % 应用最佳移动
     [mcmcState, accepted] = applyBestComprehensiveMoves(mcmcState, moves, ...
@@ -3884,77 +3889,93 @@ function strategy = selectComprehensiveAdaptiveMoveStrategy(iter, maxIter, mcmcS
 end
 %% ========== 移动策略和生成函数（续） ==========
 function [moves, moveTypes] = generateComprehensiveBatchMoves(model, strategy, ...
-    batchSize, optParams, lookupTables)
+    batchSize, optParams, lookupTables, parallelEnabled)
     % 生成综合批量移动
     moves = cell(batchSize, 1);
     moveTypes = cell(batchSize, 1);
-    
-    for i = 1:batchSize
-        switch strategy
-            % 形态相关移动
-            case 'morphology_preserving'
-                moves{i} = generateMorphologyPreservingMove(model, optParams);
-                moveTypes{i} = 'morphology_preserving';
-                
-            case 'local_shape'
-                moves{i} = generateLocalShapeMove(model, lookupTables);
-                moveTypes{i} = 'local_shape';
-                
-            case 'boundary_smooth'
-                moves{i} = generateBoundarySmoothingMove(model);
-                moveTypes{i} = 'boundary_smooth';
-                
-            case 'cluster_shape'
-                moves{i} = generateClusterShapeMove(model, optParams);
-                moveTypes{i} = 'cluster_shape';
-                
-            case 'fine_morphology'
-                moves{i} = generateFineMorphologyMove(model, optParams);
-                moveTypes{i} = 'fine_morphology';
-                
-            % 空间相关移动
-            case 'spatial_aware'
-                moves{i} = generateSpatialAwareMove(model, lookupTables);
-                moveTypes{i} = 'spatial_aware';
-                
-            case 'spatial_correlation'
-                moves{i} = generateSpatialCorrelationMove(model, optParams);
-                moveTypes{i} = 'spatial_correlation';
-                
-            case 'anisotropy_adjust'
-                moves{i} = generateAnisotropyAdjustMove(model, lookupTables);
-                moveTypes{i} = 'anisotropy_adjust';
-                
-            case 'connectivity_enhance'
-                moves{i} = generateConnectivityEnhanceMove(model, optParams);
-                moveTypes{i} = 'connectivity_enhance';
-                
-            % 通用移动
-            case 'structure_coherence'
-                moves{i} = generateStructureCoherenceMove(model, lookupTables);
-                moveTypes{i} = 'structure_coherence';
-                
-            case 'large_scale'
-                moves{i} = generateLargeScaleMove(model, optParams);
-                moveTypes{i} = 'large_scale';
-                
-            case 'fine_tune'
-                moves{i} = generateFineTuneMove(model);
-                moveTypes{i} = 'fine_tune';
-                
-            case 'cluster'
-                moves{i} = generateClusterMove(model, optParams);
-                moveTypes{i} = 'cluster';
-                
-            case 'boundary'
-                moves{i} = generateBoundaryMove(model);
-                moveTypes{i} = 'boundary';
-                
-            otherwise
-                % 默认移动类型
-                moves{i} = generateLocalMove(model, 5);
-                moveTypes{i} = 'local';
+
+    if batchSize <= 0
+        return;
+    end
+
+    if nargin < 6 || isempty(parallelEnabled)
+        parallelEnabled = shouldUseParallel(batchSize, numel(model));
+    end
+
+    if parallelEnabled
+        parfor i = 1:batchSize
+            [moves{i}, moveTypes{i}] = dispatchComprehensiveMove(model, strategy, ...
+                optParams, lookupTables);
         end
+    else
+        for i = 1:batchSize
+            [moves{i}, moveTypes{i}] = dispatchComprehensiveMove(model, strategy, ...
+                optParams, lookupTables);
+        end
+    end
+end
+function [move, moveType] = dispatchComprehensiveMove(model, strategy, optParams, lookupTables)
+    % 按策略分派单个移动生成器
+    switch strategy
+        case 'morphology_preserving'
+            move = generateMorphologyPreservingMove(model, optParams);
+            moveType = 'morphology_preserving';
+
+        case 'local_shape'
+            move = generateLocalShapeMove(model, lookupTables);
+            moveType = 'local_shape';
+
+        case 'boundary_smooth'
+            move = generateBoundarySmoothingMove(model);
+            moveType = 'boundary_smooth';
+
+        case 'cluster_shape'
+            move = generateClusterShapeMove(model, optParams);
+            moveType = 'cluster_shape';
+
+        case 'fine_morphology'
+            move = generateFineMorphologyMove(model, optParams);
+            moveType = 'fine_morphology';
+
+        case 'spatial_aware'
+            move = generateSpatialAwareMove(model, lookupTables);
+            moveType = 'spatial_aware';
+
+        case 'spatial_correlation'
+            move = generateSpatialCorrelationMove(model, optParams);
+            moveType = 'spatial_correlation';
+
+        case 'anisotropy_adjust'
+            move = generateAnisotropyAdjustMove(model, lookupTables);
+            moveType = 'anisotropy_adjust';
+
+        case 'connectivity_enhance'
+            move = generateConnectivityEnhanceMove(model, optParams);
+            moveType = 'connectivity_enhance';
+
+        case 'structure_coherence'
+            move = generateStructureCoherenceMove(model, lookupTables);
+            moveType = 'structure_coherence';
+
+        case 'large_scale'
+            move = generateLargeScaleMove(model, optParams);
+            moveType = 'large_scale';
+
+        case 'fine_tune'
+            move = generateFineTuneMove(model);
+            moveType = 'fine_tune';
+
+        case 'cluster'
+            move = generateClusterMove(model, optParams);
+            moveType = 'cluster';
+
+        case 'boundary'
+            move = generateBoundaryMove(model);
+            moveType = 'boundary';
+
+        otherwise
+            move = generateLocalMove(model, 5);
+            moveType = 'local';
     end
 end
 %% ========== 具体移动生成函数 ==========
@@ -4912,21 +4933,44 @@ function move = generateBoundaryMove(model)
 end
 %% ========== 评估和应用函数 ==========
 function deltaEnergies = evaluateComprehensiveBatchMoves(mcmcState, moves, ...
-    moveTypes, lookupTables, phase)
+    moveTypes, lookupTables, phase, parallelEnabled)
     % 评估综合批量移动
     nMoves = length(moves);
     deltaEnergies = zeros(nMoves, 1);
-    
-    for i = 1:nMoves
-        try
-            % 根据移动类型和当前阶段评估能量变化
-            deltaEnergies(i) = evaluateComprehensiveMoveDelta(mcmcState, moves{i}, ...
-                moveTypes{i}, lookupTables, phase);
-        catch ME
-            % 如果评估失败，使用简化方法
-            warning('评估移动 %d 时出错: %s', i, ME.message);
-            deltaEnergies(i) = evaluateSimpleMoveDelta(mcmcState, moves{i});
+
+    if nMoves == 0
+        return;
+    end
+
+    if nargin < 6 || isempty(parallelEnabled)
+        parallelEnabled = shouldUseParallel(nMoves, numel(mcmcState.model));
+    end
+
+    if parallelEnabled && nMoves > 1
+        parfor i = 1:nMoves
+            deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
+                moveTypes{i}, lookupTables, phase, i);
         end
+    else
+        for i = 1:nMoves
+            deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
+                moveTypes{i}, lookupTables, phase, i);
+        end
+    end
+end
+function deltaE = safeEvaluateComprehensiveMove(mcmcState, move, moveType, ...
+    lookupTables, phase, moveIndex)
+    % 并行安全的能量评估包装器
+    try
+        deltaE = evaluateComprehensiveMoveDelta(mcmcState, move, moveType, ...
+            lookupTables, phase);
+    catch ME
+        warning('评估移动 %d 时出错: %s', moveIndex, ME.message);
+        deltaE = evaluateSimpleMoveDelta(mcmcState, move);
+    end
+
+    if ~isfinite(deltaE)
+        deltaE = evaluateSimpleMoveDelta(mcmcState, move);
     end
 end
 function deltaE = evaluateComprehensiveMoveDelta(mcmcState, move, moveType, ...
@@ -6607,5 +6651,39 @@ function match = calculateMorphologyMatch(currentMorph, targetMorph)
     
     % 确保在[0,1]范围
     match = max(0, min(1, match));
+end
+function useParallel = shouldUseParallel(batchSize, problemSize)
+    % 判断是否应启用并行计算
+    if nargin < 1
+        batchSize = 0;
+    end
+    if nargin < 2
+        problemSize = 0;
+    end
+
+    useParallel = false;
+    if batchSize < 4
+        return;
+    end
+
+    try
+        pool = gcp('nocreate');
+        if isempty(pool)
+            if batchSize >= 8 && problemSize >= 2e5
+                try
+                    pool = parpool('threads');
+                catch
+                    try
+                        pool = parpool;
+                    catch
+                        pool = [];
+                    end
+                end
+            end
+        end
+        useParallel = ~isempty(pool);
+    catch
+        useParallel = false;
+    end
 end
 %% 主函数结束
