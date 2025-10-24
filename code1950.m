@@ -112,6 +112,11 @@ if parallelEnabled
     batchSize = max(batchSize, 24);
     fprintf('检测到并行资源，批量移动数调整为 %d 并启用并行评估。\n', batchSize);
 end
+featureParallelEnabled = shouldUseParallel(max(8, batchSize), numel(mcmcModel));
+if parallelEnabled && ~featureParallelEnabled
+    % 如果批量评估已启用并行，但特征更新尚未启用，强制共享池
+    featureParallelEnabled = true;
+end
 % 自适应能量函数权重
 weights = struct();
 weights.cluster = 6.0;
@@ -123,7 +128,7 @@ weights.multiScale = 4.0;
 weights.shapePreservation = 10.0;
 weights.structureCoherence = 6.0; % 新增：结构一致性权重
 % 初始化MCMC状态
-mcmcState = initializeComprehensiveMCMCState(mcmcModel, optParams, weights);
+mcmcState = initializeComprehensiveMCMCState(mcmcModel, optParams, weights, featureParallelEnabled);
 % 自适应温度控制
 T0 = 0.4;
 cooling_rate = 0.9996;
@@ -140,7 +145,21 @@ morphology_phase_end = round(maxIterations * 0.35);
 spatial_phase_end = round(maxIterations * 0.65);
 for iter = 1:maxIterations
     iterStart = tic;
-    
+
+    if mod(iter, 25) == 1
+        pool = [];
+        try
+            pool = gcp('nocreate');
+        catch
+            pool = [];
+        end
+        if isempty(pool)
+            featureParallelEnabled = shouldUseParallel(max(8, batchSize), numel(mcmcState.model));
+        else
+            featureParallelEnabled = true;
+        end
+    end
+
     % 阶段控制和权重调整
     if iter <= morphology_phase_end
         optimization_phase = 'morphology';
@@ -167,9 +186,9 @@ for iter = 1:maxIterations
     
     % 定期强制检查
     if mod(iter, 40) == 0
-        mcmcState = enforceComprehensiveConstraints(mcmcState, optParams, optimization_phase);
+        mcmcState = enforceComprehensiveConstraints(mcmcState, optParams, optimization_phase, featureParallelEnabled);
         % 重新计算所有特征
-        mcmcState = updateAllFeatures(mcmcState);
+        mcmcState = updateAllFeatures(mcmcState, featureParallelEnabled);
     end
     
     % 自适应选择移动策略
@@ -186,7 +205,7 @@ for iter = 1:maxIterations
     
     % 应用最佳移动
     [mcmcState, accepted] = applyBestComprehensiveMoves(mcmcState, moves, ...
-        deltaEnergies, mcmcState.temperature, moveTypes);
+        deltaEnergies, mcmcState.temperature, moveTypes, featureParallelEnabled);
     
     % 更新温度
     if mod(iter, 100) == 0
@@ -226,7 +245,7 @@ for iter = 1:maxIterations
     % 自适应调整
     if mod(iter, 200) == 0
         mcmcState = comprehensiveAdaptiveAdjustment(mcmcState, performanceMonitor, ...
-            iter, optimization_phase);
+            iter, optimization_phase, featureParallelEnabled);
     end
 end
 totalTime = toc(startTime);
@@ -2864,27 +2883,24 @@ function newModel = applyClusterNeighborhoodMove(model, move)
     newModel(move.linearIdx) = move.newValues;
 end
 %% ========== MCMC状态和控制函数 ==========
-function mcmcState = initializeComprehensiveMCMCState(model, optParams, weights)
+function mcmcState = initializeComprehensiveMCMCState(model, optParams, weights, parallelHint)
     % 初始化综合MCMC状态
+    if nargin < 4
+        parallelHint = [];
+    end
     mcmcState = struct();
     mcmcState.model = model;
     mcmcState.bestModel = model;
     mcmcState.temperature = 0.4;
-    
+
     % 存储优化参数和权重
     mcmcState.optParams = optParams;
     mcmcState.weights = weights;
-    
-    % 计算初始特征
-    mcmcState.features = extractEfficientClusterFeatures(model);
-    mcmcState.spatialFeatures = computeEnhancedSpatialFeatures(model);
-    mcmcState.morphologyFeatures = computeDetailedMorphologyFeatures(model);
-    mcmcState.multiScaleSpatialFeatures = computeMultiScaleSpatialFeatures(model);
-    
-    % 计算初始能量
-    mcmcState.currentEnergy = calculateComprehensiveEnergy(mcmcState);
+
+    % 计算初始特征与能量（支持并行）
+    mcmcState = updateAllFeatures(mcmcState, parallelHint);
     mcmcState.bestEnergy = mcmcState.currentEnergy;
-    
+
     % 性能跟踪
     mcmcState.acceptanceRate = 0.3;
     mcmcState.moveHistory = zeros(1, 10);
@@ -2937,7 +2953,7 @@ function currentWeights = adjustWeightsForPhase(baseWeights, phase)
     end
 end
 %% ========== 能量计算函数 ==========
-function energy = calculateComprehensiveEnergy(mcmcState)
+function energy = calculateComprehensiveEnergy(mcmcState, parallelHint)
     % 计算综合能量函数
     features = mcmcState.features;
     spatialFeatures = mcmcState.spatialFeatures;
@@ -2945,17 +2961,70 @@ function energy = calculateComprehensiveEnergy(mcmcState)
     multiScaleSpatialFeatures = mcmcState.multiScaleSpatialFeatures;
     optParams = mcmcState.optParams;
     weights = mcmcState.weights;
-    
-    % 基础能量组件
-    E_porosity = calculatePorosityEnergy(features, optParams);
-    E_cluster = calculateClusterEnergy(features, optParams);
-    E_morphology = calculateMorphologyEnergy(morphologyFeatures, optParams);
-    E_spatial = calculateSpatialEnergy(spatialFeatures, optParams);
-    E_connectivity = calculateConnectivityEnergy(spatialFeatures, optParams);
-    E_multiScale = calculateMultiScaleEnergy(multiScaleSpatialFeatures, optParams);
-    E_shapePreservation = calculateShapePreservationEnergy(features, morphologyFeatures, optParams);
-    E_structureCoherence = calculateStructureCoherenceEnergy(mcmcState);
-    
+
+    if nargin < 2
+        parallelHint = [];
+    end
+
+    if isempty(parallelHint)
+        parallelEnabled = shouldUseParallel(8, numel(mcmcState.model));
+    else
+        parallelEnabled = logical(parallelHint);
+        if parallelEnabled
+            pool = [];
+            try
+                pool = gcp('nocreate');
+            catch
+                pool = [];
+            end
+            if isempty(pool)
+                parallelEnabled = shouldUseParallel(8, numel(mcmcState.model));
+            end
+        end
+    end
+
+    if parallelEnabled
+        componentResults = zeros(8, 1);
+        parfor compIdx = 1:8
+            switch compIdx
+                case 1
+                    componentResults(compIdx) = calculatePorosityEnergy(features, optParams);
+                case 2
+                    componentResults(compIdx) = calculateClusterEnergy(features, optParams);
+                case 3
+                    componentResults(compIdx) = calculateMorphologyEnergy(morphologyFeatures, optParams);
+                case 4
+                    componentResults(compIdx) = calculateSpatialEnergy(spatialFeatures, optParams);
+                case 5
+                    componentResults(compIdx) = calculateConnectivityEnergy(spatialFeatures, optParams);
+                case 6
+                    componentResults(compIdx) = calculateMultiScaleEnergy(multiScaleSpatialFeatures, optParams);
+                case 7
+                    componentResults(compIdx) = calculateShapePreservationEnergy(features, morphologyFeatures, optParams);
+                case 8
+                    componentResults(compIdx) = calculateStructureCoherenceEnergy(mcmcState);
+            end
+        end
+        E_porosity = componentResults(1);
+        E_cluster = componentResults(2);
+        E_morphology = componentResults(3);
+        E_spatial = componentResults(4);
+        E_connectivity = componentResults(5);
+        E_multiScale = componentResults(6);
+        E_shapePreservation = componentResults(7);
+        E_structureCoherence = componentResults(8);
+    else
+        % 基础能量组件（顺序计算）
+        E_porosity = calculatePorosityEnergy(features, optParams);
+        E_cluster = calculateClusterEnergy(features, optParams);
+        E_morphology = calculateMorphologyEnergy(morphologyFeatures, optParams);
+        E_spatial = calculateSpatialEnergy(spatialFeatures, optParams);
+        E_connectivity = calculateConnectivityEnergy(spatialFeatures, optParams);
+        E_multiScale = calculateMultiScaleEnergy(multiScaleSpatialFeatures, optParams);
+        E_shapePreservation = calculateShapePreservationEnergy(features, morphologyFeatures, optParams);
+        E_structureCoherence = calculateStructureCoherenceEnergy(mcmcState);
+    end
+
     % 综合能量
     energy = weights.porosity * E_porosity + ...
         weights.cluster * E_cluster + ...
@@ -3279,13 +3348,61 @@ function coherence = computeLocalCoherence(window)
     coherence = mean(abs(gx_norm * mean_dir(1) + gy_norm * mean_dir(2) + gz_norm * mean_dir(3)));
 end
 %% ========== 特征更新和约束函数 ==========
-function mcmcState = updateAllFeatures(mcmcState)
-    % 更新所有特征
-    mcmcState.features = extractEfficientClusterFeatures(mcmcState.model);
-    mcmcState.spatialFeatures = computeEnhancedSpatialFeatures(mcmcState.model);
-    mcmcState.morphologyFeatures = computeDetailedMorphologyFeatures(mcmcState.model);
-    mcmcState.multiScaleSpatialFeatures = computeMultiScaleSpatialFeatures(mcmcState.model);
-    mcmcState.currentEnergy = calculateComprehensiveEnergy(mcmcState);
+function mcmcState = updateAllFeatures(mcmcState, parallelHint)
+    % 更新所有特征，支持并行特征提取与能量评估
+    if nargin < 2
+        parallelHint = [];
+    end
+
+    model = mcmcState.model;
+    if isempty(model)
+        return;
+    end
+
+    if isempty(parallelHint)
+        parallelEnabled = shouldUseParallel(8, numel(model));
+    else
+        parallelEnabled = logical(parallelHint);
+        if parallelEnabled
+            pool = [];
+            try
+                pool = gcp('nocreate');
+            catch
+                pool = [];
+            end
+            if isempty(pool)
+                parallelEnabled = shouldUseParallel(8, numel(model));
+            end
+        end
+    end
+
+    if parallelEnabled
+        featureResults = cell(4, 1);
+        parfor idx = 1:4
+            switch idx
+                case 1
+                    featureResults{idx} = extractEfficientClusterFeatures(model);
+                case 2
+                    featureResults{idx} = computeEnhancedSpatialFeatures(model);
+                case 3
+                    featureResults{idx} = computeDetailedMorphologyFeatures(model);
+                case 4
+                    featureResults{idx} = computeMultiScaleSpatialFeatures(model);
+            end
+        end
+        mcmcState.features = featureResults{1};
+        mcmcState.spatialFeatures = featureResults{2};
+        mcmcState.morphologyFeatures = featureResults{3};
+        mcmcState.multiScaleSpatialFeatures = featureResults{4};
+    else
+        mcmcState.features = extractEfficientClusterFeatures(model);
+        mcmcState.spatialFeatures = computeEnhancedSpatialFeatures(model);
+        mcmcState.morphologyFeatures = computeDetailedMorphologyFeatures(model);
+        mcmcState.multiScaleSpatialFeatures = computeMultiScaleSpatialFeatures(model);
+    end
+
+    mcmcState.currentEnergy = calculateComprehensiveEnergy(mcmcState, parallelEnabled);
+
     % 如果能量有所改进，更新最佳记录
     if isfield(mcmcState, 'bestEnergy')
         if mcmcState.currentEnergy < mcmcState.bestEnergy
@@ -3294,8 +3411,11 @@ function mcmcState = updateAllFeatures(mcmcState)
         end
     end
 end
-function mcmcState = enforceComprehensiveConstraints(mcmcState, optParams, phase)
+function mcmcState = enforceComprehensiveConstraints(mcmcState, optParams, phase, parallelHint)
     % 强制执行综合约束
+    if nargin < 4
+        parallelHint = [];
+    end
     switch phase
         case 'morphology'
             % 形态阶段：重点强制形态约束
@@ -3312,7 +3432,7 @@ function mcmcState = enforceComprehensiveConstraints(mcmcState, optParams, phase
     mcmcState.model = enforceClusterSizeConstraints(mcmcState.model, optParams);
     mcmcState.model = enforceTargetClusterCount(mcmcState.model, optParams);
     % 约束后立即刷新特征和能量，保证评估指标可靠
-    mcmcState = updateAllFeatures(mcmcState);
+    mcmcState = updateAllFeatures(mcmcState, parallelHint);
 end
 function mcmcState = enforceMorphologyConstraints(mcmcState, optParams)
     % 强制执行形态学约束
@@ -5204,8 +5324,11 @@ function deltaE = evaluateSimpleMoveDelta(mcmcState, move)
     deltaE = deltaE + 0.01 * randn();
 end
 function [mcmcState, accepted] = applyBestComprehensiveMoves(mcmcState, moves, ...
-    deltaEnergies, temperature, moveTypes)
+    deltaEnergies, temperature, moveTypes, parallelHint)
     % 应用最佳综合移动
+    if nargin < 6
+        parallelHint = [];
+    end
     accepted = false;
     % 过滤掉无效的能量值
     validIdx = ~isnan(deltaEnergies) & ~isinf(deltaEnergies);
@@ -5232,7 +5355,7 @@ function [mcmcState, accepted] = applyBestComprehensiveMoves(mcmcState, moves, .
             candidateState = mcmcState;
             candidateState.model = mcmcState.model;
             candidateState.model(validLinearIdx) = validNewValues;
-            candidateState = updateAllFeatures(candidateState);
+            candidateState = updateAllFeatures(candidateState, parallelHint);
             actualDeltaE = candidateState.currentEnergy - mcmcState.currentEnergy;
 
             % Metropolis准则（基于真实能量差）
@@ -5300,8 +5423,11 @@ function performanceMonitor = updatePerformanceMetrics(performanceMonitor, mcmcS
     end
 end
 function mcmcState = comprehensiveAdaptiveAdjustment(mcmcState, performanceMonitor, ...
-    iter, phase)
+    iter, phase, parallelHint)
     % 综合自适应调整
+    if nargin < 5
+        parallelHint = [];
+    end
     
     % 检查能量停滞
     if std(mcmcState.energyTrend) < 1e-6
@@ -5321,7 +5447,7 @@ function mcmcState = comprehensiveAdaptiveAdjustment(mcmcState, performanceMonit
         end
         
         % 更新特征
-        mcmcState = updateAllFeatures(mcmcState);
+        mcmcState = updateAllFeatures(mcmcState, parallelHint);
     end
     
     % 温度调整
