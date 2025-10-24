@@ -206,7 +206,55 @@ for iter = 1:maxIterations
     % 应用最佳移动
     [mcmcState, accepted] = applyBestComprehensiveMoves(mcmcState, moves, ...
         deltaEnergies, mcmcState.temperature, moveTypes, featureParallelEnabled);
-    
+
+    % 更新匹配度记录
+    currentMorphMatch = calculateMorphologyMatch(mcmcState.morphologyFeatures, ...
+        mcmcState.optParams.morphologyFeatures);
+    currentSpatialMatch = calculateSpatialMatch(mcmcState.spatialFeatures, ...
+        mcmcState.optParams.spatialFeatures);
+    mcmcState.currentMorphMatch = currentMorphMatch;
+    mcmcState.currentSpatialMatch = currentSpatialMatch;
+    matchTolerance = 5e-3;
+
+    % 更新最佳匹配模型
+    improvedMorph = currentMorphMatch > mcmcState.bestMorphMatch + matchTolerance;
+    improvedSpatial = currentSpatialMatch > mcmcState.bestSpatialMatch + matchTolerance;
+    if improvedMorph || improvedSpatial
+        mcmcState.bestMorphMatch = max(mcmcState.bestMorphMatch, currentMorphMatch);
+        mcmcState.bestSpatialMatch = max(mcmcState.bestSpatialMatch, currentSpatialMatch);
+        mcmcState.bestMatchModel = mcmcState.model;
+    end
+
+    % 记录优化历史
+    if isfield(mcmcState, 'optimizationHistory')
+        mcmcState.optimizationHistory.morphologyMatches(end+1) = currentMorphMatch; %#ok<AGROW>
+        mcmcState.optimizationHistory.spatialMatches(end+1) = currentSpatialMatch; %#ok<AGROW>
+        mcmcState.optimizationHistory.iterations(end+1) = iter; %#ok<AGROW>
+    end
+
+    % 检查500次迭代退回条件
+    checkpointInterval = mcmcState.checkpointInterval;
+    if checkpointInterval > 0 && mod(iter, checkpointInterval) == 0
+        if (currentMorphMatch < mcmcState.checkpointBaselineMorph - matchTolerance) && ...
+                (currentSpatialMatch < mcmcState.checkpointBaselineSpatial - matchTolerance)
+            fprintf('  检测到形态/空间匹配度下降，回退到历史最佳模型 (迭代 %d)。\n', iter);
+            mcmcState.model = mcmcState.bestMatchModel;
+            mcmcState = updateAllFeatures(mcmcState, featureParallelEnabled);
+            mcmcState.currentMorphMatch = calculateMorphologyMatch(mcmcState.morphologyFeatures, ...
+                mcmcState.optParams.morphologyFeatures);
+            mcmcState.currentSpatialMatch = calculateSpatialMatch(mcmcState.spatialFeatures, ...
+                mcmcState.optParams.spatialFeatures);
+            mcmcState.bestMorphMatch = max(mcmcState.bestMorphMatch, mcmcState.currentMorphMatch);
+            mcmcState.bestSpatialMatch = max(mcmcState.bestSpatialMatch, mcmcState.currentSpatialMatch);
+            mcmcState.bestMatchModel = mcmcState.model;
+            mcmcState.bestEnergy = min(mcmcState.bestEnergy, mcmcState.currentEnergy);
+            mcmcState.bestModel = mcmcState.bestMatchModel;
+        end
+        mcmcState.checkpointBaselineMorph = mcmcState.bestMorphMatch;
+        mcmcState.checkpointBaselineSpatial = mcmcState.bestSpatialMatch;
+        mcmcState.lastCheckpointIter = iter;
+    end
+
     % 更新温度
     if mod(iter, 100) == 0
         switch optimization_phase
@@ -2901,6 +2949,19 @@ function mcmcState = initializeComprehensiveMCMCState(model, optParams, weights,
     mcmcState = updateAllFeatures(mcmcState, parallelHint);
     mcmcState.bestEnergy = mcmcState.currentEnergy;
 
+    % 初始化匹配度跟踪
+    mcmcState.currentMorphMatch = calculateMorphologyMatch(mcmcState.morphologyFeatures, ...
+        mcmcState.optParams.morphologyFeatures);
+    mcmcState.currentSpatialMatch = calculateSpatialMatch(mcmcState.spatialFeatures, ...
+        mcmcState.optParams.spatialFeatures);
+    mcmcState.bestMorphMatch = mcmcState.currentMorphMatch;
+    mcmcState.bestSpatialMatch = mcmcState.currentSpatialMatch;
+    mcmcState.bestMatchModel = model;
+    mcmcState.checkpointInterval = 500;
+    mcmcState.lastCheckpointIter = 0;
+    mcmcState.checkpointBaselineMorph = mcmcState.bestMorphMatch;
+    mcmcState.checkpointBaselineSpatial = mcmcState.bestSpatialMatch;
+
     % 性能跟踪
     mcmcState.acceptanceRate = 0.3;
     mcmcState.moveHistory = zeros(1, 10);
@@ -2910,6 +2971,7 @@ function mcmcState = initializeComprehensiveMCMCState(model, optParams, weights,
     mcmcState.optimizationHistory = struct();
     mcmcState.optimizationHistory.morphologyMatches = [];
     mcmcState.optimizationHistory.spatialMatches = [];
+    mcmcState.optimizationHistory.iterations = [];
     mcmcState.optimizationHistory.phaseTransitions = [];
 end
 function performanceMonitor = initializeComprehensivePerformanceMonitor(maxIterations)
