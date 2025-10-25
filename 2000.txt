@@ -2807,11 +2807,13 @@ function model = adjustClusterSizeDistribution(model, optParams)
         fprintf('    批量调整%d个大簇尺寸 (平均缩减率%.1f%%) ...\n', ...
             numel(largeClusters), avgReduction * 100);
 
-        for i = 1:numel(largeClusters)
-            model(origPixelLists{i}) = false;
+        if ~isempty(origPixelLists)
+            origIdxAll = vertcat(origPixelLists{:});
+            model(origIdxAll) = false;
         end
-        for i = 1:numel(largeClusters)
-            model(refinedPixelLists{i}) = true;
+        if ~isempty(refinedPixelLists)
+            refinedIdxAll = vertcat(refinedPixelLists{:});
+            model(refinedIdxAll) = true;
         end
     end
 
@@ -2886,14 +2888,30 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
         return;
     end
 
-    cutoff = quantile(distances, reductionRatio);
-    removalMask = localMask & (distMap <= cutoff);
-    refinedLocal = localMask;
-    refinedLocal(removalMask) = false;
+    candidateRatios = generateReductionRatios(reductionRatio, currentSize, targetSize);
+    if isempty(candidateRatios)
+        candidateRatios = reductionRatio;
+    end
+    nCandidates = numel(candidateRatios);
+    candidateMasks = cell(nCandidates, 1);
+    candidateScores = inf(nCandidates, 1);
 
-    se = strel('sphere', 1);
-    refinedLocal = imclose(refinedLocal, se);
-    if ~any(refinedLocal(:))
+    useParallel = shouldUseParallel(nCandidates, currentSize);
+    if useParallel
+        parfor c = 1:nCandidates
+            [candidateMasks{c}, candidateScores(c)] = evaluateReductionCandidate( ...
+                localMask, distMap, distances, candidateRatios(c), targetSize);
+        end
+    else
+        for c = 1:nCandidates
+            [candidateMasks{c}, candidateScores(c)] = evaluateReductionCandidate( ...
+                localMask, distMap, distances, candidateRatios(c), targetSize);
+        end
+    end
+
+    [~, bestIdx] = min(candidateScores);
+    refinedLocal = candidateMasks{bestIdx};
+    if isempty(refinedLocal)
         refinedLocal = localMask;
     end
 
@@ -2902,6 +2920,78 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
     ry = ry + minY - 1;
     rz = rz + minZ - 1;
     refinedIdx = sub2ind(volumeSize, rx, ry, rz);
+end
+function ratios = generateReductionRatios(baseRatio, currentSize, targetSize)
+    if ~isfinite(baseRatio) || baseRatio <= 0
+        ratios = [];
+        return;
+    end
+
+    desiredReduction = max((currentSize - targetSize) / max(currentSize, 1), 0);
+    if desiredReduction <= 0
+        ratios = [];
+        return;
+    end
+
+    baseRatio = max(min(baseRatio, 0.95), 0.05);
+    desiredReduction = max(min(desiredReduction, 0.95), 0.05);
+
+    spread = max(0.1, min(0.35, desiredReduction * 0.6));
+    offsets = linspace(-spread, spread, 8);
+    ratios = baseRatio + offsets;
+    ratios(end + 1) = desiredReduction;
+    ratios(end + 1) = baseRatio;
+    ratios = max(min(ratios, 0.95), 0.02);
+    ratios = unique(ratios);
+end
+function [candidateMask, score] = evaluateReductionCandidate(localMask, distMap, localDistances, ratio, targetSize)
+    candidateMask = localMask;
+    score = inf;
+
+    if ~isfinite(ratio) || ratio <= 0
+        return;
+    end
+
+    if isempty(localDistances)
+        score = abs(nnz(candidateMask) - targetSize) / max(targetSize, 1);
+        return;
+    end
+
+    cutoff = quantile(localDistances, min(max(ratio, 0.01), 0.99));
+    removalMask = localMask & (distMap <= cutoff);
+    candidateMask(removalMask) = false;
+
+    if ~any(candidateMask(:))
+        candidateMask = localMask;
+        score = abs(nnz(candidateMask) - targetSize) / max(targetSize, 1);
+        return;
+    end
+
+    se = strel('sphere', 1);
+    candidateMask = imclose(candidateMask, se);
+
+    candidateSize = nnz(candidateMask);
+    if candidateSize == 0
+        candidateMask = localMask;
+        score = abs(nnz(candidateMask) - targetSize) / max(targetSize, 1);
+        return;
+    end
+
+    CC = bwconncomp(candidateMask, 26);
+    connectivityPenalty = max(CC.NumObjects - 1, 0);
+
+    sizePenalty = abs(candidateSize - targetSize) / max(targetSize, 1);
+    compactnessPenalty = 0;
+    candidateDistances = distMap(candidateMask);
+    if ~isempty(candidateDistances)
+        meanDist = mean(candidateDistances);
+        stdDist = std(double(candidateDistances));
+        if stdDist > 0
+            compactnessPenalty = max(0, 1 - meanDist / (stdDist + eps));
+        end
+    end
+
+    score = sizePenalty + 0.5 * connectivityPenalty + 0.1 * compactnessPenalty;
 end
 function model = reduceOversizedCluster(model, clusterIdx, optParams)
     % 通过平滑收缩的方式减少大簇体量
