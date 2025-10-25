@@ -3225,7 +3225,8 @@ function globalIdx = localToGlobalIndices(region, localIdx)
     globalIdx = sub2ind(region.volumeSize, subs{:});
 end
 
-function model = applyClusterIndicesUpdate(model, removalIdx, additionIdx)
+function model = applyClusterIndicesUpdate(model, removalIdx, additionIdx, varargin)
+    %#ok<*INUSD> % 忽略未使用的可选参数，兼容旧版调用
     if nargin < 2 || isempty(removalIdx)
         removalIdx = [];
     end
