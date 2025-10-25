@@ -2513,8 +2513,7 @@ function model = adjustClusterSizeDistribution(model, optParams, densityMap)
             refinedIdx = reduceOversizedClusterIndices(CC.PixelIdxList{oversized}, ...
                 size(model), targetMax, densityMap);
             if ~isempty(refinedIdx)
-                model(CC.PixelIdxList{oversized}) = false;
-                model(refinedIdx) = true;
+                model = applyClusterIndicesUpdate(model, CC.PixelIdxList{oversized}, refinedIdx);
                 updated = true;
                 continue;
             end
@@ -2526,13 +2525,12 @@ function model = adjustClusterSizeDistribution(model, optParams, densityMap)
                 grownIdx = growSmallClusterIndices(CC.PixelIdxList{undersized}, ...
                     size(model), targetMin, densityMap);
                 if ~isempty(grownIdx)
-                    model(CC.PixelIdxList{undersized}) = false;
-                    model(grownIdx) = true;
+                    model = applyClusterIndicesUpdate(model, CC.PixelIdxList{undersized}, grownIdx);
                 else
-                    model(CC.PixelIdxList{undersized}) = false;
+                    model = applyClusterIndicesUpdate(model, CC.PixelIdxList{undersized}, []);
                 end
             else
-                model(CC.PixelIdxList{undersized}) = false;
+                model = applyClusterIndicesUpdate(model, CC.PixelIdxList{undersized}, []);
             end
             updated = true;
             continue;
@@ -2581,8 +2579,7 @@ function model = fineTuneClusterStatistics(model, optParams, densityMap)
                 end
                 refinedIdx = reduceOversizedClusterIndices(CC.PixelIdxList{idx}, size(model), targetMax, densityMap);
                 if ~isempty(refinedIdx)
-                    model(CC.PixelIdxList{idx}) = false;
-                    model(refinedIdx) = true;
+                    model = applyClusterIndicesUpdate(model, CC.PixelIdxList{idx}, refinedIdx);
                 end
             end
             stats = computeClusterStatistics(model);
@@ -2600,11 +2597,10 @@ function model = fineTuneClusterStatistics(model, optParams, densityMap)
                 if isfield(optParams, 'preserveSmallPores') && optParams.preserveSmallPores
                     grownIdx = growSmallClusterIndices(CC.PixelIdxList{idx}, size(model), targetMin, densityMap);
                     if ~isempty(grownIdx)
-                        model(CC.PixelIdxList{idx}) = false;
-                        model(grownIdx) = true;
+                        model = applyClusterIndicesUpdate(model, CC.PixelIdxList{idx}, grownIdx);
                     end
                 else
-                    model(CC.PixelIdxList{idx}) = false;
+                    model = applyClusterIndicesUpdate(model, CC.PixelIdxList{idx}, []);
                 end
             end
             stats = computeClusterStatistics(model);
@@ -2623,8 +2619,7 @@ function model = fineTuneClusterStatistics(model, optParams, densityMap)
                 for idx = oversized'
                     refinedIdx = reduceOversizedClusterIndices(CC.PixelIdxList{idx}, size(model), targetMax, densityMap);
                     if ~isempty(refinedIdx)
-                        model(CC.PixelIdxList{idx}) = false;
-                        model(refinedIdx) = true;
+                        model = applyClusterIndicesUpdate(model, CC.PixelIdxList{idx}, refinedIdx);
                     end
                 end
                 stats = computeClusterStatistics(model);
@@ -2637,11 +2632,10 @@ function model = fineTuneClusterStatistics(model, optParams, densityMap)
                     if isfield(optParams, 'preserveSmallPores') && optParams.preserveSmallPores
                         grownIdx = growSmallClusterIndices(CC.PixelIdxList{idx}, size(model), targetMin, densityMap);
                         if ~isempty(grownIdx)
-                            model(CC.PixelIdxList{idx}) = false;
-                            model(grownIdx) = true;
+                            model = applyClusterIndicesUpdate(model, CC.PixelIdxList{idx}, grownIdx);
                         end
                     else
-                        model(CC.PixelIdxList{idx}) = false;
+                        model = applyClusterIndicesUpdate(model, CC.PixelIdxList{idx}, []);
                     end
                 end
                 stats = computeClusterStatistics(model);
@@ -2778,8 +2772,7 @@ function model = reduceOversizedCluster(model, clusterIdx, optParams)
         densityMap = optParams.referenceDensityMap;
     end
     refinedIdx = reduceOversizedClusterIndices(clusterIdx, size(model), targetSize, densityMap);
-    model(clusterIdx) = false;
-    model(refinedIdx) = true;
+    model = applyClusterIndicesUpdate(model, clusterIdx, refinedIdx);
 end
 function grownIdx = growSmallClusterIndices(clusterIdx, volumeSize, targetSize, densityMap)
     % 通过优先在高密度方向生长的方式扩展小簇
@@ -2877,8 +2870,7 @@ function model = growSmallCluster(model, clusterIdx, optParams)
         targetSize = numel(clusterIdx) * 2;
     end
     grownIdx = growSmallClusterIndices(clusterIdx, size(model), targetSize, densityMap);
-    model(clusterIdx) = false;
-    model(grownIdx) = true;
+    model = applyClusterIndicesUpdate(model, clusterIdx, grownIdx);
 end
 
 function region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, padding)
@@ -2983,6 +2975,70 @@ function globalIdx = localToGlobalIndices(region, localIdx)
         subs{d} = subs{d} + region.offset(d);
     end
     globalIdx = sub2ind(region.volumeSize, subs{:});
+end
+
+function model = applyClusterIndicesUpdate(model, removalIdx, additionIdx)
+    if nargin < 2 || isempty(removalIdx)
+        removalIdx = [];
+    end
+    if nargin < 3 || isempty(additionIdx)
+        additionIdx = [];
+    end
+    if isempty(removalIdx) && isempty(additionIdx)
+        return;
+    end
+
+    volumeSize = size(model);
+    numDims = numel(volumeSize);
+    combined = double([removalIdx(:); additionIdx(:)]);
+    combined = combined(~isnan(combined));
+    combined = unique(combined);
+    if isempty(combined)
+        return;
+    end
+
+    [subs{1:numDims}] = ind2sub(volumeSize, combined);
+    minCoords = zeros(1, numDims);
+    maxCoords = zeros(1, numDims);
+    for d = 1:numDims
+        minCoords(d) = min(subs{d});
+        maxCoords(d) = max(subs{d});
+    end
+
+    ranges = cell(1, numDims);
+    for d = 1:numDims
+        ranges{d} = minCoords(d):maxCoords(d);
+    end
+
+    block = model(ranges{:});
+    blockSize = double(size(block));
+    blockSize = blockSize(:)';
+    if numel(blockSize) < numDims
+        blockSize(numDims) = 1;
+    else
+        blockSize = blockSize(1:numDims);
+    end
+
+    if ~isempty(removalIdx)
+        localRemoval = convertGlobalToLocal(removalIdx, minCoords, blockSize, volumeSize);
+        block(localRemoval) = false;
+    end
+
+    if ~isempty(additionIdx)
+        localAddition = convertGlobalToLocal(additionIdx, minCoords, blockSize, volumeSize);
+        block(localAddition) = true;
+    end
+
+    model(ranges{:}) = block;
+end
+
+function localIdx = convertGlobalToLocal(globalIdx, minCoords, blockSize, volumeSize)
+    numDims = numel(volumeSize);
+    [subs{1:numDims}] = ind2sub(volumeSize, double(globalIdx));
+    for d = 1:numDims
+        subs{d} = subs{d} - minCoords(d) + 1;
+    end
+    localIdx = sub2ind(blockSize, subs{:});
 end
 
 function connectivity = computeConnectivity(numDims)
