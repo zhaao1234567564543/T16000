@@ -2714,30 +2714,28 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
         return;
     end
 
-    mask = false(volumeSize);
-    mask(clusterIdx) = true;
-
-    [x, y, z] = ind2sub(volumeSize, clusterIdx);
-    centroid = [mean(x), mean(y), mean(z)];
-
-    normalizedDensity = [];
-    if ~isempty(densityMap)
-        normalizedDensity = densityMap;
-        normalizedDensity = normalizedDensity - min(normalizedDensity(:));
-        normalizedDensity = normalizedDensity / (max(normalizedDensity(:)) + eps);
-    end
+    region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, 2);
+    mask = region.mask;
+    normalizedDensity = region.density;
+    centroid = computeMaskCentroid(region.clusterLocalIdx, region.size);
+    numDims = numel(volumeSize);
+    connectivity = computeConnectivity(numDims);
 
     maxIterations = 4 * ceil((currentSize - targetSize) / max(1, targetSize));
     iter = 0;
     while nnz(mask) > targetSize && iter < maxIterations
         iter = iter + 1;
-        boundary = bwperim(mask, 26);
+        boundary = bwperim(mask, connectivity);
         candidates = find(boundary);
         if isempty(candidates)
             break;
         end
-        [bx, by, bz] = ind2sub(volumeSize, candidates);
-        dist = sqrt((bx - centroid(1)).^2 + (by - centroid(2)).^2 + (bz - centroid(3)).^2);
+        [subs{1:numDims}] = ind2sub(region.size, candidates);
+        dist = zeros(numel(candidates), 1);
+        for d = 1:numDims
+            dist = dist + (subs{d} - centroid(d)).^2;
+        end
+        dist = sqrt(dist);
         if ~isempty(dist)
             dist = dist / (max(dist) + eps);
         end
@@ -2752,11 +2750,11 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
         removeIdx = candidates(order(1:removeCount));
         mask(removeIdx) = false;
 
-        CC = bwconncomp(mask, 26);
+        CC = bwconncomp(mask, connectivity);
         if CC.NumObjects > 1
             sizes = cellfun(@numel, CC.PixelIdxList);
             [~, keepIdx] = max(sizes);
-            newMask = false(volumeSize);
+            newMask = false(region.size);
             newMask(CC.PixelIdxList{keepIdx}) = true;
             mask = newMask;
         end
@@ -2769,7 +2767,8 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
         mask(voxels) = true;
     end
 
-    refinedIdx = find(mask);
+    region.mask = mask;
+    refinedIdx = localToGlobalIndices(region, find(mask));
 end
 function model = reduceOversizedCluster(model, clusterIdx, optParams)
     % 通过平滑收缩的方式减少大簇体量
@@ -2788,75 +2787,79 @@ function grownIdx = growSmallClusterIndices(clusterIdx, volumeSize, targetSize, 
         densityMap = [];
     end
     targetSize = max(1, round(targetSize));
-    mask = false(volumeSize);
-    mask(clusterIdx) = true;
+    numDims = numel(volumeSize);
+    basePadding = max(3, ceil(nthroot(double(targetSize), numDims)));
+    region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, basePadding);
+    mask = region.mask;
+    normalizedDensity = region.density;
 
     currentSize = nnz(mask);
     if currentSize >= targetSize
-        grownIdx = clusterIdx;
+        grownIdx = localToGlobalIndices(region, find(mask));
         return;
     end
 
-    [x, y, z] = ind2sub(volumeSize, clusterIdx);
-    centroid = [mean(x), mean(y), mean(z)];
-
-    normalizedDensity = [];
-    if ~isempty(densityMap)
-        normalizedDensity = densityMap;
-        normalizedDensity = normalizedDensity - min(normalizedDensity(:));
-        normalizedDensity = normalizedDensity / (max(normalizedDensity(:)) + eps);
-    end
-
-    se = strel('sphere', 1);
-    maxIterations = 4 * ceil((targetSize - currentSize) / max(1, currentSize));
+    dilateKernel = true(repmat(3, 1, numDims));
+    connectivity = computeConnectivity(numDims);
+    maxIterations = 10 * max(1, targetSize - currentSize);
     iter = 0;
     while nnz(mask) < targetSize && iter < maxIterations
         iter = iter + 1;
-        dilated = imdilate(mask, se);
-        candidates = find(dilated & ~mask);
-        if isempty(candidates)
-            break;
+        dilated = imdilate(mask, dilateKernel);
+        candidatesMask = dilated & ~mask;
+        if ~any(candidatesMask(:))
+            if all(region.minCoords == 1 & region.maxCoords == region.volumeSize)
+                break;
+            end
+            region = expandLocalRegion(region, 2, densityMap);
+            mask = region.mask;
+            normalizedDensity = region.density;
+            continue;
         end
-        [cx, cy, cz] = ind2sub(volumeSize, candidates);
-        dist = sqrt((cx - centroid(1)).^2 + (cy - centroid(2)).^2 + (cz - centroid(3)).^2);
+        candidates = find(candidatesMask);
+        centroid = computeMaskCentroid(find(mask), region.size);
+        [subs{1:numDims}] = ind2sub(region.size, candidates);
+        dist = zeros(numel(candidates), 1);
+        for d = 1:numDims
+            dist = dist + (subs{d} - centroid(d)).^2;
+        end
+        dist = sqrt(dist);
         if ~isempty(dist)
             dist = dist / (max(dist) + eps);
         end
-        score = 1 - dist;
+        score = -dist;
         if ~isempty(normalizedDensity)
             densityVals = normalizedDensity(candidates);
-            score = score + 0.35 * densityVals;
+            score = score + 0.45 * densityVals;
         end
         [~, order] = sort(score, 'descend');
-        addCount = min(targetSize - nnz(mask), max(1, round(0.02 * targetSize)));
+        addCount = min(targetSize - nnz(mask), max(1, round(0.03 * targetSize)));
         addCount = min(addCount, numel(order));
         addIdx = candidates(order(1:addCount));
         mask(addIdx) = true;
-
-        CC = bwconncomp(mask, 26);
+        region.mask = mask;
+        CC = bwconncomp(mask, connectivity);
         if CC.NumObjects > 1
             sizes = cellfun(@numel, CC.PixelIdxList);
             [~, keepIdx] = max(sizes);
-            newMask = false(volumeSize);
+            newMask = false(region.size);
             newMask(CC.PixelIdxList{keepIdx}) = true;
             mask = newMask;
+            region.mask = mask;
         end
     end
 
     if nnz(mask) < targetSize
-        dilated = mask;
-        while nnz(mask) < targetSize
-            dilated = imdilate(dilated, se);
-            extra = find(dilated & ~mask);
-            if isempty(extra)
-                break;
-            end
-            need = targetSize - nnz(mask);
-            mask(extra(1:min(need, numel(extra)))) = true;
+        available = find(~mask);
+        addCount = min(targetSize - nnz(mask), numel(available));
+        if addCount > 0
+            addIdx = available(1:addCount);
+            mask(addIdx) = true;
         end
     end
 
-    grownIdx = find(mask);
+    region.mask = mask;
+    grownIdx = localToGlobalIndices(region, find(mask));
 end
 function model = growSmallCluster(model, clusterIdx, optParams)
     % 通过局部膨胀扩展小簇，避免直接删除
@@ -2876,6 +2879,132 @@ function model = growSmallCluster(model, clusterIdx, optParams)
     grownIdx = growSmallClusterIndices(clusterIdx, size(model), targetSize, densityMap);
     model(clusterIdx) = false;
     model(grownIdx) = true;
+end
+
+function region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, padding)
+    if nargin < 4 || isempty(padding)
+        padding = 1;
+    end
+    numDims = numel(volumeSize);
+    region.volumeSize = volumeSize;
+    [subs{1:numDims}] = ind2sub(volumeSize, clusterIdx);
+    region.minCoords = zeros(1, numDims);
+    region.maxCoords = zeros(1, numDims);
+    for d = 1:numDims
+        minCoord = floor(min(subs{d}) - padding);
+        maxCoord = ceil(max(subs{d}) + padding);
+        region.minCoords(d) = max(1, minCoord);
+        region.maxCoords(d) = min(volumeSize(d), maxCoord);
+    end
+    region.size = region.maxCoords - region.minCoords + 1;
+    region.offset = region.minCoords - 1;
+    region.mask = false(region.size);
+    localSubs = cell(1, numDims);
+    for d = 1:numDims
+        localSubs{d} = subs{d} - region.minCoords(d) + 1;
+    end
+    region.clusterLocalIdx = sub2ind(region.size, localSubs{:});
+    region.mask(region.clusterLocalIdx) = true;
+    region.density = [];
+    if ~isempty(densityMap)
+        idxRanges = cell(1, numDims);
+        for d = 1:numDims
+            idxRanges{d} = region.minCoords(d):region.maxCoords(d);
+        end
+        try
+            localDensity = densityMap(idxRanges{:});
+            localDensity = localDensity - min(localDensity(:));
+            localDensity = localDensity / (max(localDensity(:)) + eps);
+            region.density = localDensity;
+        catch
+            region.density = [];
+        end
+    end
+end
+
+function region = expandLocalRegion(region, extraPadding, densityMap)
+    if nargin < 2 || isempty(extraPadding)
+        extraPadding = 1;
+    end
+    if nargin < 3
+        densityMap = [];
+    end
+    numDims = numel(region.volumeSize);
+    newMin = max(1, region.minCoords - extraPadding);
+    newMax = min(region.volumeSize, region.maxCoords + extraPadding);
+    if all(newMin == region.minCoords) && all(newMax == region.maxCoords)
+        return;
+    end
+
+    newSize = newMax - newMin + 1;
+    newMask = false(newSize);
+    existingIdx = find(region.mask);
+    if ~isempty(existingIdx)
+        [subs{1:numDims}] = ind2sub(region.size, existingIdx);
+        for d = 1:numDims
+            subs{d} = subs{d} + (region.minCoords(d) - newMin(d));
+        end
+        newIdx = sub2ind(newSize, subs{:});
+        newMask(newIdx) = true;
+    end
+
+    region.mask = newMask;
+    region.size = newSize;
+    region.minCoords = newMin;
+    region.maxCoords = newMax;
+    region.offset = region.minCoords - 1;
+    region.clusterLocalIdx = find(region.mask);
+
+    region.density = [];
+    if ~isempty(densityMap)
+        idxRanges = cell(1, numDims);
+        for d = 1:numDims
+            idxRanges{d} = region.minCoords(d):region.maxCoords(d);
+        end
+        try
+            localDensity = densityMap(idxRanges{:});
+            localDensity = localDensity - min(localDensity(:));
+            localDensity = localDensity / (max(localDensity(:)) + eps);
+            region.density = localDensity;
+        catch
+            region.density = [];
+        end
+    end
+end
+
+function globalIdx = localToGlobalIndices(region, localIdx)
+    if isempty(localIdx)
+        globalIdx = [];
+        return;
+    end
+    numDims = numel(region.volumeSize);
+    [subs{1:numDims}] = ind2sub(region.size, localIdx);
+    for d = 1:numDims
+        subs{d} = subs{d} + region.offset(d);
+    end
+    globalIdx = sub2ind(region.volumeSize, subs{:});
+end
+
+function connectivity = computeConnectivity(numDims)
+    if nargin < 1 || isempty(numDims)
+        connectivity = 26;
+        return;
+    end
+    connectivity = 3^numDims - 1;
+    connectivity = min(26, max(1, connectivity));
+end
+
+function centroid = computeMaskCentroid(linearIdx, sizeVec)
+    numDims = numel(sizeVec);
+    centroid = zeros(1, numDims);
+    if isempty(linearIdx)
+        centroid = (double(sizeVec) + 1) / 2;
+        return;
+    end
+    [subs{1:numDims}] = ind2sub(sizeVec, linearIdx);
+    for d = 1:numDims
+        centroid(d) = mean(subs{d});
+    end
 end
 function model = applySpatialCorrection(model, currentSpatial, targetSpatial)
     % 应用空间修正
