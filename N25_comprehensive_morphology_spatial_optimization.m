@@ -2588,26 +2588,66 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
     localIdx = sub2ind(localSize, localX, localY, localZ);
     localMask(localIdx) = true;
 
-    distMap = bwdist(~localMask);
-    reductionRatio = min(0.45, max(0, (currentSize - targetSize) / currentSize));
-    if reductionRatio <= 0
-        refinedIdx = clusterIdx;
-        return;
-    end
-
-    distances = distMap(localMask);
-    if isempty(distances) || all(distances == 0)
-        refinedIdx = clusterIdx;
-        return;
-    end
-
-    cutoff = quantile(distances, reductionRatio);
-    removalMask = localMask & (distMap <= cutoff);
     refinedLocal = localMask;
-    refinedLocal(removalMask) = false;
-
     se = strel('sphere', 1);
-    refinedLocal = imclose(refinedLocal, se);
+    maxIterations = min(18, max(6, ceil((currentSize - targetSize) / max(targetSize, 1)) + 6));
+
+    for iter = 1:maxIterations
+        currentCount = nnz(refinedLocal);
+        if currentCount <= targetSize
+            break;
+        end
+
+        boundary = bwperim(refinedLocal, 26);
+        boundaryIdx = find(boundary);
+
+        if isempty(boundaryIdx)
+            eroded = imerode(refinedLocal, se);
+            if nnz(eroded) == 0
+                break;
+            end
+            refinedLocal = eroded;
+            refinedLocal = keepLargestComponent(refinedLocal);
+            continue;
+        end
+
+        excess = currentCount - targetSize;
+        removalBudget = min(numel(boundaryIdx), max(1, round(0.5 * excess)));
+        removalSelection = boundaryIdx(randperm(numel(boundaryIdx), removalBudget));
+        refinedLocal(removalSelection) = false;
+
+        refinedLocal = imclose(refinedLocal, se);
+        refinedLocal = keepLargestComponent(refinedLocal);
+    end
+
+    currentCount = nnz(refinedLocal);
+    if currentCount > targetSize
+        % 额外的形态腐蚀确保尺寸收敛
+        extraIters = 0;
+        while currentCount > targetSize && extraIters < 6
+            eroded = imerode(refinedLocal, se);
+            if nnz(eroded) == 0
+                break;
+            end
+            refinedLocal = eroded;
+            refinedLocal = keepLargestComponent(refinedLocal);
+            currentCount = nnz(refinedLocal);
+            extraIters = extraIters + 1;
+        end
+    elseif currentCount < targetSize
+        % 适量回填，保持目标体量
+        deficit = targetSize - currentCount;
+        if deficit > 0
+            candidateMask = imdilate(refinedLocal, se) & localMask & ~refinedLocal;
+            candidateIdx = find(candidateMask);
+            if ~isempty(candidateIdx)
+                addCount = min(deficit, numel(candidateIdx));
+                addSelection = candidateIdx(randperm(numel(candidateIdx), addCount));
+                refinedLocal(addSelection) = true;
+            end
+        end
+    end
+
     if ~any(refinedLocal(:))
         refinedLocal = localMask;
     end
@@ -2651,6 +2691,18 @@ function grownIdx = growSmallClusterIndices(clusterIdx, volumeSize)
     gy = gy + minY - 1;
     gz = gz + minZ - 1;
     grownIdx = sub2ind(volumeSize, gx, gy, gz);
+end
+
+function mask = keepLargestComponent(mask)
+    % 保留局部掩膜中最大的连通域，避免簇被切碎
+    CC = bwconncomp(mask, 26);
+    if CC.NumObjects <= 1
+        return;
+    end
+    sizes = cellfun(@numel, CC.PixelIdxList);
+    [~, idx] = max(sizes);
+    mask = false(size(mask));
+    mask(CC.PixelIdxList{idx}) = true;
 end
 function model = growSmallCluster(model, clusterIdx)
     % 通过局部膨胀扩展小簇，避免直接删除
