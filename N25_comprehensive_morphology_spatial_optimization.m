@@ -1682,9 +1682,28 @@ function mcmcModel = generateComprehensiveInitialModel(dims, targetPorosity, ...
     % 6. 多指标确定性优化
     nOptSteps = 40;
     for step = 1:nOptSteps
-        currentSpatial = computeEnhancedSpatialFeatures(model);
-        currentMorph = computeDetailedMorphologyFeatures(model);
-        currentMultiScale = computeMultiScaleSpatialFeatures(model);
+        useParallel = shouldUseParallel(8, numel(model));
+        if useParallel
+            featureCells = cell(3, 1);
+            parfor featIdx = 1:3
+                switch featIdx
+                    case 1
+                        featureCells{featIdx} = computeEnhancedSpatialFeatures(model);
+                    case 2
+                        featureCells{featIdx} = computeDetailedMorphologyFeatures(model);
+                    case 3
+                        featureCells{featIdx} = computeMultiScaleSpatialFeatures(model);
+                end
+            end
+            currentSpatial = featureCells{1};
+            currentMorph = featureCells{2};
+            currentMultiScale = featureCells{3};
+        else
+            currentSpatial = computeEnhancedSpatialFeatures(model);
+            currentMorph = computeDetailedMorphologyFeatures(model);
+            currentMultiScale = computeMultiScaleSpatialFeatures(model);
+        end
+
         spatialMatch = calculateSpatialMatch(currentSpatial, spatialFeatures);
         morphMatch = calculateMorphologyMatch(currentMorph, morphologyFeatures);
         multiScaleMatch = calculateMultiScaleMatch(currentMultiScale, optParams.multiScaleSpatialFeatures);
@@ -2174,19 +2193,49 @@ function model = calibrateInitialModelToTargets(model, targetSpatial, targetMorp
             end
         end
 
-        % 计算当前特征
-        currentSpatial = computeEnhancedSpatialFeatures(model);
-        currentMorph = computeDetailedMorphologyFeatures(model);
-        spatialMatch = calculateSpatialMatch(currentSpatial, targetSpatial);
-        morphMatch = calculateMorphologyMatch(currentMorph, targetMorph);
+        % 计算当前特征（并行提取提升CPU占用）
+        useParallel = shouldUseParallel(8, numel(model));
+        hasMultiScale = isfield(optParams, 'multiScaleSpatialFeatures') && ...
+            ~isempty(optParams.multiScaleSpatialFeatures);
 
-        currentMultiScale = [];
-        multiScaleMatch = 1;
-        if isfield(optParams, 'multiScaleSpatialFeatures') && ...
-                ~isempty(optParams.multiScaleSpatialFeatures)
-            currentMultiScale = computeMultiScaleSpatialFeatures(model);
-            multiScaleMatch = calculateMultiScaleMatch(currentMultiScale, ...
-                optParams.multiScaleSpatialFeatures);
+        if useParallel
+            taskCount = 2 + hasMultiScale;
+            featureResults = cell(taskCount, 1);
+            parfor taskIdx = 1:taskCount
+                switch taskIdx
+                    case 1
+                        featureResults{taskIdx} = computeEnhancedSpatialFeatures(model);
+                    case 2
+                        featureResults{taskIdx} = computeDetailedMorphologyFeatures(model);
+                    case 3
+                        featureResults{taskIdx} = computeMultiScaleSpatialFeatures(model);
+                end
+            end
+            currentSpatial = featureResults{1};
+            currentMorph = featureResults{2};
+            spatialMatch = calculateSpatialMatch(currentSpatial, targetSpatial);
+            morphMatch = calculateMorphologyMatch(currentMorph, targetMorph);
+
+            currentMultiScale = [];
+            multiScaleMatch = 1;
+            if hasMultiScale
+                currentMultiScale = featureResults{3};
+                multiScaleMatch = calculateMultiScaleMatch(currentMultiScale, ...
+                    optParams.multiScaleSpatialFeatures);
+            end
+        else
+            currentSpatial = computeEnhancedSpatialFeatures(model);
+            currentMorph = computeDetailedMorphologyFeatures(model);
+            spatialMatch = calculateSpatialMatch(currentSpatial, targetSpatial);
+            morphMatch = calculateMorphologyMatch(currentMorph, targetMorph);
+
+            currentMultiScale = [];
+            multiScaleMatch = 1;
+            if hasMultiScale
+                currentMultiScale = computeMultiScaleSpatialFeatures(model);
+                multiScaleMatch = calculateMultiScaleMatch(currentMultiScale, ...
+                    optParams.multiScaleSpatialFeatures);
+            end
         end
 
         % 空间特征偏差校正
@@ -2588,62 +2637,55 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
     localIdx = sub2ind(localSize, localX, localY, localZ);
     localMask(localIdx) = true;
 
-    refinedLocal = localMask;
+    % 使用距离场快速确定需要移除的边界层，提高CPU占用
     se = strel('sphere', 1);
-    maxIterations = min(18, max(6, ceil((currentSize - targetSize) / max(targetSize, 1)) + 6));
+    refinedLocal = localMask;
 
-    for iter = 1:maxIterations
-        currentCount = nnz(refinedLocal);
-        if currentCount <= targetSize
-            break;
-        end
+    removalCount = currentSize - targetSize;
+    if removalCount <= 0
+        refinedIdx = clusterIdx;
+        return;
+    end
 
-        boundary = bwperim(refinedLocal, 26);
-        boundaryIdx = find(boundary);
+    distanceMap = computeLocalDistanceField(localMask);
+    localLinearIdx = find(localMask);
+    distanceValues = distanceMap(localLinearIdx);
 
-        if isempty(boundaryIdx)
-            eroded = imerode(refinedLocal, se);
-            if nnz(eroded) == 0
-                break;
-            end
-            refinedLocal = eroded;
-            refinedLocal = keepLargestComponent(refinedLocal);
-            continue;
-        end
+    % 先批量移除距离较小的体素，快速收缩簇外壳
+    [~, removalOrder] = sort(distanceValues, 'ascend');
+    keepMask = true(numel(localLinearIdx), 1);
+    removalCount = min(removalCount, numel(removalOrder));
+    keepMask(removalOrder(1:removalCount)) = false;
+    refinedLocal = false(localSize);
+    refinedLocal(localLinearIdx(keepMask)) = true;
 
-        excess = currentCount - targetSize;
-        removalBudget = min(numel(boundaryIdx), max(1, round(0.5 * excess)));
-        removalSelection = boundaryIdx(randperm(numel(boundaryIdx), removalBudget));
-        refinedLocal(removalSelection) = false;
+    % 保留最大连通域，避免被削成碎片
+    refinedLocal = keepLargestComponent(refinedLocal);
 
-        refinedLocal = imclose(refinedLocal, se);
+    % 如果仍然超出目标，继续根据距离分数细调
+    currentCount = nnz(refinedLocal);
+    if currentCount > targetSize
+        extraRemoval = currentCount - targetSize;
+        trimmedIdx = find(refinedLocal);
+        trimmedDistances = distanceMap(trimmedIdx);
+        [~, extraOrder] = sort(trimmedDistances, 'ascend');
+        extraRemoval = min(extraRemoval, numel(extraOrder));
+        refinedLocal(trimmedIdx(extraOrder(1:extraRemoval))) = false;
         refinedLocal = keepLargestComponent(refinedLocal);
     end
 
+    % 适量回填，确保与原目标尺寸一致
     currentCount = nnz(refinedLocal);
-    if currentCount > targetSize
-        % 额外的形态腐蚀确保尺寸收敛
-        extraIters = 0;
-        while currentCount > targetSize && extraIters < 6
-            eroded = imerode(refinedLocal, se);
-            if nnz(eroded) == 0
-                break;
-            end
-            refinedLocal = eroded;
-            refinedLocal = keepLargestComponent(refinedLocal);
-            currentCount = nnz(refinedLocal);
-            extraIters = extraIters + 1;
-        end
-    elseif currentCount < targetSize
-        % 适量回填，保持目标体量
+    if currentCount < targetSize
         deficit = targetSize - currentCount;
         if deficit > 0
             candidateMask = imdilate(refinedLocal, se) & localMask & ~refinedLocal;
             candidateIdx = find(candidateMask);
             if ~isempty(candidateIdx)
-                addCount = min(deficit, numel(candidateIdx));
-                addSelection = candidateIdx(randperm(numel(candidateIdx), addCount));
-                refinedLocal(addSelection) = true;
+                candidateDistances = distanceMap(candidateIdx);
+                [~, addOrder] = sort(candidateDistances, 'descend');
+                addCount = min(deficit, numel(addOrder));
+                refinedLocal(candidateIdx(addOrder(1:addCount))) = true;
             end
         end
     end
@@ -2652,11 +2694,42 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
         refinedLocal = localMask;
     end
 
+    refinedLocal = imclose(refinedLocal, se) & localMask;
+    refinedLocal = keepLargestComponent(refinedLocal);
+
     [rx, ry, rz] = ind2sub(localSize, find(refinedLocal));
     rx = rx + minX - 1;
     ry = ry + minY - 1;
     rz = rz + minZ - 1;
     refinedIdx = sub2ind(volumeSize, rx, ry, rz);
+end
+
+function distanceMap = computeLocalDistanceField(localMask)
+    % 计算局部掩膜的距离场，优先使用多线程距离变换
+    try
+        distanceMap = bwdist(~localMask);
+        return;
+    catch
+        distanceMap = [];
+    end
+
+    % 回退方案：使用多次平滑卷积近似距离
+    distanceMap = zeros(size(localMask), 'double');
+    se = strel('sphere', 1);
+    working = localMask;
+    layer = 1;
+    maxLayers = max(size(localMask));
+    while any(working(:)) && layer <= maxLayers
+        boundary = working & ~imerode(working, se);
+        distanceMap(boundary) = layer;
+        working = imerode(working, se);
+        layer = layer + 1;
+    end
+    distanceMap(~localMask) = 0;
+    zeroMask = localMask & distanceMap == 0;
+    if any(zeroMask(:))
+        distanceMap(zeroMask) = max(distanceMap(:)) + 1;
+    end
 end
 function model = reduceOversizedCluster(model, clusterIdx, optParams)
     % 通过平滑收缩的方式减少大簇体量
