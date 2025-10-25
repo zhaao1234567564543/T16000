@@ -2708,6 +2708,20 @@ function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targ
         return;
     end
 
+    numDims = numel(volumeSize);
+    [subs{1:numDims}] = ind2sub(volumeSize, clusterIdx);
+    minCoords = zeros(1, numDims);
+    maxCoords = zeros(1, numDims);
+    for d = 1:numDims
+        minCoords(d) = max(1, floor(min(subs{d}) - 2));
+        maxCoords(d) = min(volumeSize(d), ceil(max(subs{d}) + 2));
+    end
+    regionSize = maxCoords - minCoords + 1;
+    if prod(double(regionSize)) > getMaxLocalRegionElements()
+        refinedIdx = reduceLargeClusterDirectly(clusterIdx, volumeSize, targetSize, densityMap, subs);
+        return;
+    end
+
     region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, 2);
     mask = region.mask;
     normalizedDensity = region.density;
@@ -2782,6 +2796,19 @@ function grownIdx = growSmallClusterIndices(clusterIdx, volumeSize, targetSize, 
     targetSize = max(1, round(targetSize));
     numDims = numel(volumeSize);
     basePadding = max(3, ceil(nthroot(double(targetSize), numDims)));
+    [subs{1:numDims}] = ind2sub(volumeSize, clusterIdx);
+    minCoords = zeros(1, numDims);
+    maxCoords = zeros(1, numDims);
+    for d = 1:numDims
+        minCoords(d) = max(1, floor(min(subs{d}) - basePadding));
+        maxCoords(d) = min(volumeSize(d), ceil(max(subs{d}) + basePadding));
+    end
+    regionSize = maxCoords - minCoords + 1;
+    if prod(double(regionSize)) > getMaxLocalRegionElements()
+        grownIdx = growClusterWithDirectExpansion(clusterIdx, volumeSize, targetSize, densityMap, subs);
+        return;
+    end
+
     region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, basePadding);
     mask = region.mask;
     normalizedDensity = region.density;
@@ -2912,6 +2939,227 @@ function region = initializeLocalRegion(clusterIdx, volumeSize, densityMap, padd
             region.density = [];
         end
     end
+end
+
+function refinedIdx = reduceLargeClusterDirectly(clusterIdx, volumeSize, targetSize, densityMap, subs)
+    clusterIdx = unique(clusterIdx(:));
+    targetSize = max(1, round(targetSize));
+    if numel(clusterIdx) <= targetSize
+        refinedIdx = clusterIdx;
+        return;
+    end
+
+    numDims = numel(volumeSize);
+    if nargin < 5 || isempty(subs)
+        [subs{1:numDims}] = ind2sub(volumeSize, clusterIdx);
+    end
+
+    coords = zeros(numel(clusterIdx), numDims);
+    for d = 1:numDims
+        coords(:, d) = double(subs{d}(:));
+    end
+
+    densityVals = [];
+    if ~isempty(densityMap)
+        try
+            densityVals = double(densityMap(clusterIdx));
+        catch
+            densityVals = [];
+        end
+    end
+    if isempty(densityVals)
+        densityVals = zeros(numel(clusterIdx), 1);
+    end
+
+    centroid = mean(coords, 1);
+    dist = zeros(numel(clusterIdx), 1);
+    for d = 1:numDims
+        dist = dist + (coords(:, d) - centroid(d)).^2;
+    end
+    dist = sqrt(dist);
+    if ~isempty(dist)
+        dist = dist / (max(dist) + eps);
+    end
+
+    if numel(densityVals) > 1
+        densityVals = densityVals - min(densityVals);
+        densityVals = densityVals / (max(densityVals) + eps);
+    end
+    score = dist - 0.35 * densityVals;
+
+    while numel(clusterIdx) > targetSize
+        removeCount = min(numel(clusterIdx) - targetSize, max(1, round(0.01 * numel(clusterIdx))));
+        [~, order] = sort(score, 'descend');
+        removeIdx = order(1:removeCount);
+
+        keepMask = true(numel(clusterIdx), 1);
+        keepMask(removeIdx) = false;
+
+        clusterIdx = clusterIdx(keepMask);
+        coords = coords(keepMask, :);
+        densityVals = densityVals(keepMask);
+
+        centroid = mean(coords, 1);
+        dist = zeros(numel(clusterIdx), 1);
+        for d = 1:numDims
+            dist = dist + (coords(:, d) - centroid(d)).^2;
+        end
+        dist = sqrt(dist);
+        if ~isempty(dist)
+            dist = dist / (max(dist) + eps);
+        end
+
+        if numel(densityVals) > 1
+            densityVals = densityVals - min(densityVals);
+            densityVals = densityVals / (max(densityVals) + eps);
+        end
+        score = dist - 0.35 * densityVals;
+    end
+
+    refinedIdx = clusterIdx(:);
+end
+
+function grownIdx = growClusterWithDirectExpansion(clusterIdx, volumeSize, targetSize, densityMap, subs)
+    clusterIdx = unique(clusterIdx(:));
+    targetSize = max(1, round(targetSize));
+    if numel(clusterIdx) >= targetSize
+        grownIdx = clusterIdx;
+        return;
+    end
+
+    numDims = numel(volumeSize);
+    if nargin < 5 || isempty(subs)
+        [subs{1:numDims}] = ind2sub(volumeSize, clusterIdx);
+    end
+
+    coords = zeros(numel(clusterIdx), numDims);
+    for d = 1:numDims
+        coords(:, d) = double(subs{d}(:));
+    end
+
+    neighborOffsets = getNeighborOffsets(numDims);
+
+    while numel(clusterIdx) < targetSize
+        sampleFraction = 0.005;
+        rawSamples = ceil(sampleFraction * numel(clusterIdx));
+        sampleCount = min(numel(clusterIdx), max(200, min(20000, rawSamples)));
+        sampleIdx = unique(max(1, round(linspace(1, numel(clusterIdx), sampleCount))));
+        maxCandidates = numel(sampleIdx) * size(neighborOffsets, 1);
+        candidateCoords = zeros(maxCandidates, numDims);
+        candCount = 0;
+        for s = 1:numel(sampleIdx)
+            baseCoord = coords(sampleIdx(s), :);
+            for o = 1:size(neighborOffsets, 1)
+                neighborCoord = baseCoord + neighborOffsets(o, :);
+                if any(neighborCoord < 1) || any(neighborCoord > volumeSize)
+                    continue;
+                end
+                candCount = candCount + 1;
+                candidateCoords(candCount, :) = neighborCoord;
+            end
+        end
+
+        if candCount == 0
+            break;
+        end
+
+        candidateCoords = candidateCoords(1:candCount, :);
+        candidateSubs = cell(1, numDims);
+        for d = 1:numDims
+            candidateSubs{d} = candidateCoords(:, d);
+        end
+        candidateIdx = sub2ind(volumeSize, candidateSubs{:});
+        candidateIdx = unique(candidateIdx);
+        candidateIdx = setdiff(candidateIdx, clusterIdx);
+
+        if isempty(candidateIdx)
+            break;
+        end
+
+        [candidateSubs{1:numDims}] = ind2sub(volumeSize, candidateIdx);
+        candidateCoords = zeros(numel(candidateIdx), numDims);
+        for d = 1:numDims
+            candidateCoords(:, d) = double(candidateSubs{d}(:));
+        end
+
+        centroid = mean(coords, 1);
+        dist = zeros(numel(candidateIdx), 1);
+        for d = 1:numDims
+            dist = dist + (candidateCoords(:, d) - centroid(d)).^2;
+        end
+        dist = sqrt(dist);
+        if ~isempty(dist)
+            dist = dist / (max(dist) + eps);
+        end
+
+        candidateDensity = zeros(numel(candidateIdx), 1);
+        if ~isempty(densityMap)
+            try
+                candidateDensity = double(densityMap(candidateIdx));
+            catch
+                candidateDensity = zeros(numel(candidateIdx), 1);
+            end
+        end
+        if numel(candidateDensity) > 1
+            candidateDensity = candidateDensity - min(candidateDensity);
+            candidateDensity = candidateDensity / (max(candidateDensity) + eps);
+        end
+
+        score = -dist + 0.45 * candidateDensity;
+        addCount = min(targetSize - numel(clusterIdx), max(1, round(0.02 * targetSize)));
+        [~, order] = sort(score, 'descend');
+        addCount = min(addCount, numel(order));
+        selectIdx = order(1:addCount);
+
+        clusterIdx = [clusterIdx; candidateIdx(selectIdx)];
+        coords = [coords; candidateCoords(selectIdx, :)];
+    end
+
+    if numel(clusterIdx) > targetSize
+        clusterIdx = reduceLargeClusterDirectly(clusterIdx, volumeSize, targetSize, densityMap);
+    end
+
+    grownIdx = unique(clusterIdx(:));
+end
+
+function limit = getMaxLocalRegionElements()
+    limit = 8e7;
+end
+
+function offsets = getNeighborOffsets(numDims)
+    persistent cachedOffsets;
+    persistent cachedDims;
+    if ~isempty(cachedOffsets) && isequal(cachedDims, numDims)
+        offsets = cachedOffsets;
+        return;
+    end
+    grids = cell(1, numDims);
+    for d = 1:numDims
+        grids{d} = -1:1;
+    end
+    [mesh{1:numDims}] = ndgrid(grids{:});
+    total = numel(mesh{1});
+    offsets = zeros(total - 1, numDims);
+    idx = 1;
+    for i = 1:total
+        coord = zeros(1, numDims);
+        isZero = true;
+        for d = 1:numDims
+            val = mesh{d}(i);
+            coord(d) = val;
+            if val ~= 0
+                isZero = false;
+            end
+        end
+        if isZero
+            continue;
+        end
+        offsets(idx, :) = coord;
+        idx = idx + 1;
+    end
+    offsets = offsets(1:idx-1, :);
+    cachedOffsets = offsets;
+    cachedDims = numDims;
 end
 
 function region = expandLocalRegion(region, extraPadding, densityMap)
