@@ -2684,10 +2684,28 @@ function satisfied = clusterStatsWithinTolerance(stats, targetMin, targetMax, ta
     maxTol = ceil(targetMax * 1.05);
     satisfied = stats.minSize >= minTol && stats.maxSize <= maxTol;
 end
-function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targetSize, densityMap)
+function refinedIdx = reduceOversizedClusterIndices(clusterIdx, volumeSize, targetSize, varargin)
     % 通过优先移除外围低密度体素的方式缩减簇体量
-    if nargin < 4
-        densityMap = [];
+    densityMap = [];
+    if ~isempty(varargin)
+        for iArg = 1:numel(varargin)
+            candidate = varargin{iArg};
+            if isempty(candidate)
+                continue;
+            end
+            if isnumeric(candidate) || islogical(candidate)
+                densityMap = candidate;
+                break;
+            elseif isstruct(candidate)
+                if isfield(candidate, 'densityMap') && ~isempty(candidate.densityMap)
+                    densityMap = candidate.densityMap;
+                    break;
+                elseif isfield(candidate, 'referenceDensityMap') && ~isempty(candidate.referenceDensityMap)
+                    densityMap = candidate.referenceDensityMap;
+                    break;
+                end
+            end
+        end
     end
     currentSize = numel(clusterIdx);
     targetSize = max(1, round(targetSize));
