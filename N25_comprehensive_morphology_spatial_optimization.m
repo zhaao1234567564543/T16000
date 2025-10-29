@@ -127,6 +127,11 @@ optParams.preserveSmallPores = preserve_small_pores; % 添加小孔隙保留标�
 optParams.directionalPorosityProfile = computeDirectionalPorosityProfile(binVol);
 optParams.referenceDensityMap = constructReferenceDensityMap(binVol, multiScaleSpatialFeatures);
 optParams.clusterLibrary = sampleRepresentativeClusters(binVol, morphologyFeatures);
+if auto_cluster_config
+    optParams.targetClusterTolerance = max(2, round(0.03 * target_cluster_count));
+else
+    optParams.targetClusterTolerance = max(2, round(0.02 * target_cluster_count));
+end
 % 生成快速查找表
 fprintf('正在生成快速查找表...\n');
 lookupTables = generateComprehensiveLookupTables(binVol, originalFeatures, spatialFeatures, morphologyFeatures);
@@ -1614,8 +1619,12 @@ function autoConfig = initializeAutoClusterConfig(originalFeatures, spatialFeatu
     else
         autoConfig.referenceAnisotropy = 0;
     end
+    baseCountTarget = round(mean(countRange));
+    baseCountTolerance = max(2, round(0.04 * max(baseCountTarget, 1)));
     autoConfig.currentTargets = struct('minSize', baseMin, 'maxSize', baseMax, ...
-        'count', round(mean(countRange)), 'sizeTolerance', max(3, round(baseMax * 0.1)));
+        'count', baseCountTarget, 'sizeTolerance', max(3, round(baseMax * 0.1)), ...
+        'countTolerance', baseCountTolerance);
+    autoConfig.countToleranceBase = baseCountTolerance;
     autoConfig = sampleAutoClusterTargets(autoConfig, 'initial');
 end
 function optParams = refreshAutoClusterTargets(optParams, context)
@@ -1635,6 +1644,9 @@ function optParams = refreshAutoClusterTargets(optParams, context)
     optParams.targetMin = currentTargets.minSize;
     optParams.targetMax = currentTargets.maxSize;
     optParams.targetClusterCount = currentTargets.count;
+    if isfield(currentTargets, 'countTolerance') && ~isempty(currentTargets.countTolerance)
+        optParams.targetClusterTolerance = max(2, double(currentTargets.countTolerance));
+    end
 end
 function autoConfig = sampleAutoClusterTargets(autoConfig, context)
     % 在允许范围内随机生成新的簇目标
@@ -1673,9 +1685,17 @@ function autoConfig = sampleAutoClusterTargets(autoConfig, context)
     autoConfig.currentTargets.maxSize = maxSize;
     autoConfig.currentTargets.count = count;
     autoConfig.currentTargets.sizeTolerance = max(3, round(maxSize * 0.12));
+    if isfield(autoConfig, 'countToleranceBase') && ~isempty(autoConfig.countToleranceBase)
+        baseTol = autoConfig.countToleranceBase;
+    else
+        baseTol = max(2, round(0.04 * max(count, 1)));
+    end
+    tolNoise = round(sqrt(baseTol) * randn());
+    autoConfig.currentTargets.countTolerance = max(2, baseTol + tolNoise);
     autoConfig.currentTargets.histogram = autoConfig.sizeDistribution;
     autoConfig.currentTargets.uniformity = autoConfig.spatialUniformity;
     autoConfig.currentTargets.compactness = autoConfig.compactness;
+    autoConfig.countToleranceBase = max(2, round(0.7 * baseTol + 0.3 * autoConfig.currentTargets.countTolerance));
 end
 function histVals = computeAutoClusterHistogram(sizes, edges)
     % 计算归一化簇尺寸直方图
@@ -3512,20 +3532,45 @@ function E_cluster = calculateClusterEnergy(features, optParams)
                 (currentTargets.compactness + 1e-3);
         end
         countDiff = 0;
+        countTolerance = [];
+        if isfield(currentTargets, 'countTolerance') && ~isempty(currentTargets.countTolerance)
+            countTolerance = double(currentTargets.countTolerance);
+        elseif isfield(optParams, 'targetClusterTolerance') && ...
+                ~isempty(optParams.targetClusterTolerance)
+            countTolerance = double(optParams.targetClusterTolerance);
+        else
+            countTolerance = max(1, round(0.02 * max(currentTargets.count, 1)));
+        end
         if isfield(autoCfg, 'countRange') && ~isempty(autoCfg.countRange)
             lowerBound = max(1, round(autoCfg.countRange(1)));
             upperBound = max(lowerBound, round(autoCfg.countRange(2)));
             if features.numClusters < lowerBound
-                countDiff = (lowerBound - features.numClusters) / lowerBound;
+                deficit = lowerBound - features.numClusters;
+                if countTolerance > 0
+                    deficit = max(0, deficit - countTolerance);
+                end
+                countDiff = deficit / lowerBound;
             elseif features.numClusters > upperBound
-                countDiff = (features.numClusters - upperBound) / upperBound;
+                excess = features.numClusters - upperBound;
+                if countTolerance > 0
+                    excess = max(0, excess - countTolerance);
+                end
+                countDiff = excess / upperBound;
             else
                 targetCount = currentTargets.count;
-                countDiff = 0.3 * abs(features.numClusters - targetCount) / max(targetCount, 1);
+                diffVal = abs(features.numClusters - targetCount);
+                if countTolerance > 0
+                    diffVal = max(0, diffVal - countTolerance);
+                end
+                countDiff = diffVal / max(targetCount, 1);
             end
         elseif isfield(currentTargets, 'count')
             targetCount = currentTargets.count;
-            countDiff = abs(features.numClusters - targetCount) / max(targetCount, 1);
+            diffVal = abs(features.numClusters - targetCount);
+            if countTolerance > 0
+                diffVal = max(0, diffVal - countTolerance);
+            end
+            countDiff = diffVal / max(targetCount, 1);
         end
         sizeRangePenalty = 0;
         if isfield(currentTargets, 'minSize') && isfield(currentTargets, 'maxSize')
@@ -3539,7 +3584,7 @@ function E_cluster = calculateClusterEnergy(features, optParams)
             end
         end
         E_cluster = 0.35 * histDiff + 0.2 * meanDiff + 0.15 * stdDiff + ...
-            0.15 * uniformityDiff + 0.1 * compactnessDiff + 0.05 * countDiff + 0.1 * sizeRangePenalty;
+            0.15 * uniformityDiff + 0.1 * compactnessDiff + 0.15 * countDiff + 0.1 * sizeRangePenalty;
         return;
     end
 
@@ -4102,7 +4147,12 @@ function model = enforceTargetClusterCount(model, optParams)
         return;
     end
     targetCount = max(1, round(optParams.targetClusterCount));
+    tolerance = [];
+    if isfield(optParams, 'targetClusterTolerance') && ~isempty(optParams.targetClusterTolerance)
+        tolerance = max(0, round(optParams.targetClusterTolerance));
+    end
     acceptableRange = [];
+    currentTargets = struct();
     if isfield(optParams, 'autoClusterConfig') && optParams.autoClusterConfig && ...
             isfield(optParams, 'autoClusterTargets') && ...
             isfield(optParams.autoClusterTargets, 'countRange')
@@ -4111,6 +4161,17 @@ function model = enforceTargetClusterCount(model, optParams)
         if acceptableRange(2) < acceptableRange(1)
             acceptableRange(2) = acceptableRange(1);
         end
+        if isfield(optParams.autoClusterTargets, 'currentTargets') && ...
+                ~isempty(optParams.autoClusterTargets.currentTargets)
+            currentTargets = optParams.autoClusterTargets.currentTargets;
+            if isempty(tolerance) && isfield(currentTargets, 'countTolerance') && ...
+                    ~isempty(currentTargets.countTolerance)
+                tolerance = max(0, round(currentTargets.countTolerance));
+            end
+        end
+    end
+    if isempty(tolerance)
+        tolerance = max(1, round(0.02 * targetCount));
     end
     CC = bwconncomp(model, 26);
     % 如果当前没有簇，尝试播种新的孔隙簇
@@ -4118,25 +4179,21 @@ function model = enforceTargetClusterCount(model, optParams)
         model = seedRandomCluster(model, optParams);
         CC = bwconncomp(model, 26);
     end
+    if ~isempty(acceptableRange)
+        targetCount = min(max(targetCount, acceptableRange(1)), acceptableRange(2));
+    end
     maxIterations = 50;
     iter = 0;
-    if ~isempty(acceptableRange) && CC.NumObjects >= acceptableRange(1) && ...
-            CC.NumObjects <= acceptableRange(2)
+    if abs(CC.NumObjects - targetCount) <= tolerance
         return;
-    end
-    if ~isempty(acceptableRange)
-        if CC.NumObjects < acceptableRange(1)
-            targetCount = acceptableRange(1);
-        elseif CC.NumObjects > acceptableRange(2)
-            targetCount = acceptableRange(2);
-        else
-            targetCount = max(acceptableRange(1), min(acceptableRange(2), targetCount));
-        end
     end
     while CC.NumObjects > targetCount && iter < maxIterations
         model = mergeClosestClusters(model, CC);
         CC = bwconncomp(model, 26);
         iter = iter + 1;
+        if abs(CC.NumObjects - targetCount) <= tolerance
+            break;
+        end
     end
     iter = 0;
     while CC.NumObjects < targetCount && iter < maxIterations
@@ -4146,26 +4203,54 @@ function model = enforceTargetClusterCount(model, optParams)
         if ~added
             break;
         end
+        if abs(CC.NumObjects - targetCount) <= tolerance
+            break;
+        end
     end
     % 如果迭代后仍未达到目标，执行微调
-    if CC.NumObjects ~= targetCount
-        tolerance = abs(CC.NumObjects - targetCount);
-        if CC.NumObjects > targetCount && tolerance > 0
+    if abs(CC.NumObjects - targetCount) > tolerance
+        remainingDiff = abs(CC.NumObjects - targetCount);
+        if CC.NumObjects > targetCount && remainingDiff > 0
             % 移除最小的簇以精确匹配
             sizes = cellfun(@numel, CC.PixelIdxList);
             [~, order] = sort(sizes, 'ascend');
-            removeCount = min(tolerance, length(order));
+            removeCount = min(remainingDiff, length(order));
             for i = 1:removeCount
                 model(CC.PixelIdxList{order(i)}) = false;
             end
         elseif CC.NumObjects < targetCount
             % 通过播种新的小簇补足
-            for i = 1:(targetCount - CC.NumObjects)
+            deficit = targetCount - CC.NumObjects;
+            for i = 1:deficit
                 [model, added] = addRepresentativeCluster(model, CC, optParams);
                 if ~added
                     model = seedRandomCluster(model, optParams);
                 end
                 CC = bwconncomp(model, 26);
+                if abs(CC.NumObjects - targetCount) <= tolerance
+                    break;
+                end
+            end
+        end
+    end
+    CC = bwconncomp(model, 26);
+    if abs(CC.NumObjects - targetCount) > tolerance
+        % 最终强制靠近目标
+        if CC.NumObjects > targetCount
+            sizes = cellfun(@numel, CC.PixelIdxList);
+            [~, order] = sort(sizes, 'ascend');
+            excess = min(CC.NumObjects - targetCount, numel(order));
+            for i = 1:excess
+                model(CC.PixelIdxList{order(i)}) = false;
+            end
+        elseif CC.NumObjects < targetCount
+            deficit = targetCount - CC.NumObjects;
+            for i = 1:deficit
+                model = seedRandomCluster(model, optParams);
+                CC = bwconncomp(model, 26);
+                if CC.NumObjects >= targetCount
+                    break;
+                end
             end
         end
     end
