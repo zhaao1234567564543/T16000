@@ -3480,39 +3480,42 @@ function E_cluster = calculateClusterEnergy(features, optParams)
         E_cluster = 10.0;
         return;
     end
-    
-    % 最大簇惩罚（使用指数惩罚）
-    maxSizeRatio = features.sizeStats(2) / optParams.targetMax;
-    if maxSizeRatio > 1
-        E_cluster_max = exp(2 * (maxSizeRatio - 1)) - 1;
-    else
-        E_cluster_max = 0;
-    end
-    
+
+    % 为避免目标尺度极小导致的数值问题，提供安全下界
+    safeTargetMax = max(1, double(optParams.targetMax));
+    safeTargetMin = max(1, double(optParams.targetMin));
+
+    % 最大簇惩罚（使用平滑多项式惩罚，避免指数溢出）
+    maxSizeRatio = double(features.sizeStats(2)) / safeTargetMax;
+    overshootMax = max(0, maxSizeRatio - 1);
+    E_cluster_max = overshootMax + 0.5 * overshootMax.^2;
+
     % 最小簇惩罚
-    minSizeRatio = features.sizeStats(1) / optParams.targetMin;
-    if minSizeRatio < 1
-        E_cluster_min = (1 - minSizeRatio)^2;
-    else
-        E_cluster_min = 0;
-    end
-    
+    minSizeRatio = double(features.sizeStats(1)) / safeTargetMin;
+    undershootMin = max(0, 1 - minSizeRatio);
+    E_cluster_min = undershootMin.^2;
+
     % 平均簇大小惩罚
-    targetMeanSize = (optParams.targetMax + optParams.targetMin) / 2;
-    E_cluster_mean = abs(features.sizeStats(3) - targetMeanSize) / targetMeanSize;
-    
+    targetMeanSize = max(1, (safeTargetMax + safeTargetMin) / 2);
+    currentMeanSize = double(features.sizeStats(3));
+    E_cluster_mean = abs(currentMeanSize - targetMeanSize) / targetMeanSize;
+
     % 簇数量惩罚
-    expectedNumClusters = sum(features.sizes) / targetMeanSize;
-    E_cluster_num = abs(features.numClusters - expectedNumClusters) / (expectedNumClusters + 1);
+    totalClusterVolume = sum(double(features.sizes));
+    expectedNumClusters = totalClusterVolume / targetMeanSize;
+    E_cluster_num = abs(double(features.numClusters) - expectedNumClusters) / (expectedNumClusters + 1);
+
     if isfield(optParams, 'targetClusterCount') && optParams.targetClusterCount > 0
-        targetCount = max(1, round(optParams.targetClusterCount));
-        E_cluster_target = abs(features.numClusters - targetCount) / targetCount;
+        targetCount = max(1, round(double(optParams.targetClusterCount)));
+        E_cluster_target = abs(double(features.numClusters) - targetCount) / targetCount;
     else
         E_cluster_target = 0;
     end
-    % 综合簇能量
+
+    % 综合簇能量，并限制极端值确保能量有界
     E_cluster = 3.0 * E_cluster_max + E_cluster_min + 0.5 * E_cluster_mean + ...
         0.15 * E_cluster_num + 0.65 * E_cluster_target;
+    E_cluster = min(E_cluster, 1e6);
 end
 function E_morphology = calculateMorphologyEnergy(morphologyFeatures, optParams)
     % 计算形态学能量
@@ -3723,20 +3726,32 @@ function E_structure = calculateStructureCoherenceEnergy(mcmcState)
     % 评估局部结构的连贯性
     model = mcmcState.model;
     [nx, ny, nz] = size(model);
-    
+
     % 采样评估结构连贯性
     nSamples = 20;
     coherenceScores = zeros(nSamples, 1);
-    
+
+    % 根据模型尺寸调整窗口边界，确保索引有效
+    marginX = min(9, floor((nx - 1) / 2));
+    marginY = min(9, floor((ny - 1) / 2));
+    marginZ = min(4, floor((nz - 1) / 2));
+
+    if marginX < 1 || marginY < 1 || marginZ < 1
+        % 模型尺寸过小，直接评估全局结构一致性
+        coherenceScores(:) = computeLocalCoherence(model);
+        E_structure = 1 - mean(coherenceScores);
+        return;
+    end
+
     for i = 1:nSamples
         % 随机选择一个局部区域
-        x = randi([10, nx-10]);
-        y = randi([10, ny-10]);
-        z = randi([5, nz-5]);
-        
+        x = randi([marginX + 1, nx - marginX]);
+        y = randi([marginY + 1, ny - marginY]);
+        z = randi([marginZ + 1, nz - marginZ]);
+
         % 提取局部窗口
-        window = model(x-9:x+9, y-9:y+9, z-4:z+4);
-        
+        window = model(x-marginX:x+marginX, y-marginY:y+marginY, z-marginZ:z+marginZ);
+
         % 计算局部连贯性
         coherenceScores(i) = computeLocalCoherence(window);
     end
