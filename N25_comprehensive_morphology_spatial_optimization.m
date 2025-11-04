@@ -5964,12 +5964,21 @@ function deltaEnergies = evaluateComprehensiveBatchMoves(mcmcState, moves, ...
         parallelEnabled = shouldUseParallel(nMoves, numel(mcmcState.model));
     end
     localStats = precomputeLocalMoveStatistics(mcmcState.model);
-    if parallelEnabled && nMoves > 1
-        parfor i = 1:nMoves
-            deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
-                moveTypes{i}, lookupTables, phase, i, localStats);
+    useParallel = parallelEnabled && nMoves > 1;
+    parallelSucceeded = false;
+    if useParallel
+        try
+            parfor i = 1:nMoves
+                deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
+                    moveTypes{i}, lookupTables, phase, i, localStats);
+            end
+            parallelSucceeded = true;
+        catch ME
+            warning('并行评估移动失败，降级到串行评估：%s', ME.message);
+            parallelSucceeded = false;
         end
-    else
+    end
+    if ~parallelSucceeded
         for i = 1:nMoves
             deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
                 moveTypes{i}, lookupTables, phase, i, localStats);
@@ -7687,6 +7696,9 @@ function useParallel = shouldUseParallel(batchSize, problemSize)
     if batchSize < 4
         return;
     end
+    if ~isParallelToolboxAvailable()
+        return;
+    end
     try
         % 避免在并行工作线程中递归启动并行
         currentTask = [];
@@ -7716,5 +7728,26 @@ function useParallel = shouldUseParallel(batchSize, problemSize)
     catch
         useParallel = false;
     end
+end
+function available = isParallelToolboxAvailable()
+    % 检查并缓存并行工具箱的可用性，避免在不支持的环境中调用并行API
+    persistent cachedAvailability
+    if isempty(cachedAvailability)
+        hasParpool = exist('parpool', 'file') == 2;
+        hasLicense = false;
+        try
+            hasLicense = license('test', 'Distrib_Computing_Toolbox');
+        catch
+            hasLicense = false;
+        end
+        hasParallelPkg = false;
+        try
+            hasParallelPkg = ~isempty(ver('parallel'));
+        catch
+            hasParallelPkg = false;
+        end
+        cachedAvailability = hasParpool && hasLicense && hasParallelPkg;
+    end
+    available = cachedAvailability;
 end
 %% 主函数结束
