@@ -5960,29 +5960,66 @@ function deltaEnergies = evaluateComprehensiveBatchMoves(mcmcState, moves, ...
     if nMoves == 0
         return;
     end
+    persistent parallelBatchSupported parallelFailureWarned
+    if isempty(parallelBatchSupported)
+        parallelBatchSupported = true;
+    end
+    if isempty(parallelFailureWarned)
+        parallelFailureWarned = false;
+    end
     if nargin < 6 || isempty(parallelEnabled)
         parallelEnabled = shouldUseParallel(nMoves, numel(mcmcState.model));
     end
     localStats = precomputeLocalMoveStatistics(mcmcState.model);
-    useParallel = parallelEnabled && nMoves > 1;
+    evalState = prepareMoveEvaluationState(mcmcState);
+    useParallel = parallelEnabled && nMoves > 1 && parallelBatchSupported;
     parallelSucceeded = false;
     if useParallel
         try
             parfor i = 1:nMoves
-                deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
+                deltaEnergies(i) = safeEvaluateComprehensiveMove(evalState, moves{i}, ...
                     moveTypes{i}, lookupTables, phase, i, localStats);
             end
             parallelSucceeded = true;
         catch ME
-            warning('并行评估移动失败，降级到串行评估：%s', ME.message);
+            parallelBatchSupported = false;
+            if ~parallelFailureWarned
+                warning('并行评估移动失败，降级到串行评估：%s', ME.message);
+                parallelFailureWarned = true;
+            end
             parallelSucceeded = false;
         end
     end
     if ~parallelSucceeded
         for i = 1:nMoves
-            deltaEnergies(i) = safeEvaluateComprehensiveMove(mcmcState, moves{i}, ...
+            deltaEnergies(i) = safeEvaluateComprehensiveMove(evalState, moves{i}, ...
                 moveTypes{i}, lookupTables, phase, i, localStats);
         end
+    end
+end
+function evalState = prepareMoveEvaluationState(mcmcState)
+    % 为批量能量评估准备精简状态，避免并行传递不支持的字段
+    evalState = struct();
+    evalState.model = mcmcState.model;
+    evalState.optParams = struct();
+    if isfield(mcmcState, 'optParams') && ~isempty(mcmcState.optParams)
+        evalState.optParams = mcmcState.optParams;
+    end
+    evalState.weights = mcmcState.weights;
+    if isfield(mcmcState, 'spatialFeatures')
+        evalState.spatialFeatures = mcmcState.spatialFeatures;
+    else
+        evalState.spatialFeatures = struct();
+    end
+    if isfield(mcmcState, 'morphologyFeatures')
+        evalState.morphologyFeatures = mcmcState.morphologyFeatures;
+    else
+        evalState.morphologyFeatures = struct();
+    end
+    if isfield(mcmcState, 'multiScaleSpatialFeatures')
+        evalState.multiScaleSpatialFeatures = mcmcState.multiScaleSpatialFeatures;
+    else
+        evalState.multiScaleSpatialFeatures = struct();
     end
 end
 function deltaE = safeEvaluateComprehensiveMove(mcmcState, move, moveType, ...
