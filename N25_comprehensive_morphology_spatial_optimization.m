@@ -2221,22 +2221,30 @@ function mcmcModel = generateComprehensiveInitialModel(dims, targetPorosity, ...
     targetTPC = spatialFeatures.twoPointCorr;
     targetAnisotropy = spatialFeatures.anisotropy;
     correlationLength = estimateCorrelationLength(targetTPC);
-    baseField = synthesizeDirectionalGaussianField(dims, correlationLength, ...
-        targetAnisotropy, spatialFeatures, optParams);
-    % 2. 构造多尺度密度引导场，并与基础场融合
+    % 2. 构造多尺度密度引导场
     densityMap = constructMultiScaleDensityMap(optParams, dims);
-    baseField = blendReferenceDirectionalPatterns(baseField, densityMap);
-    % 3. 自适应阈值化以获得目标孔隙率
-    threshold = computeAdaptiveThreshold(baseField, targetPorosity, optParams);
-    model = baseField > threshold;
-    model = reinforceDensityTargets(model, densityMap, targetPorosity);
-    % 4. 形态与代表性簇嵌入
-    model = applyTargetMorphology(model, morphologyFeatures);
-    model = adjustClusterSizeDistribution(model, optParams);
-    model = enforceClusterSizeConstraints(model, optParams);
-    model = embedRepresentativeClusters(model, densityMap, optParams, morphologyFeatures);
-    % 5. 匹配孔隙尺寸分布
-    model = matchPoreSizeDistribution(model, originalFeatures, optParams);
+    % 2b. 根据问题规模配置并行候选生成
+    parallelPlan = configureInitialModelParallelism(dims, optParams);
+    if parallelPlan.enableParallel
+        fprintf('\n  启用并行初始候选生成（%d 个候选）以提升CPU利用率...\n', parallelPlan.numCandidates);
+        [model, candidateDiagnostics] = generateParallelInitialCandidates(dims, targetPorosity, ...
+            originalFeatures, spatialFeatures, morphologyFeatures, optParams, densityMap, ...
+            correlationLength, targetAnisotropy, parallelPlan);
+        fprintf('    并行候选最佳匹配 -> 空间: %.3f, 形态: %.3f, 孔隙率偏差: %.3f\n', ...
+            candidateDiagnostics.bestSpatialMatch, ...
+            candidateDiagnostics.bestMorphologyMatch, ...
+            abs(candidateDiagnostics.bestPorosity - targetPorosity));
+    else
+        baseField = synthesizeDirectionalGaussianField(dims, correlationLength, ...
+            targetAnisotropy, spatialFeatures, optParams);
+        baseField = blendReferenceDirectionalPatterns(baseField, densityMap);
+        [model, sequentialSummary] = finalizeInitialCandidateModel(baseField, densityMap, ...
+            targetPorosity, originalFeatures, spatialFeatures, morphologyFeatures, optParams, true);
+        fprintf('\n    顺序候选匹配 -> 空间: %.3f, 形态: %.3f, 孔隙率偏差: %.3f\n', ...
+            sequentialSummary.spatialMatch, ...
+            sequentialSummary.morphologyMatch, ...
+            abs(sequentialSummary.porosity - targetPorosity));
+    end
     % 6. 多指标确定性优化
     nOptSteps = 40;
     for step = 1:nOptSteps
@@ -2275,9 +2283,139 @@ function mcmcModel = generateComprehensiveInitialModel(dims, targetPorosity, ...
     fprintf('  初始模型生成完成');
     mcmcModel = model;
 end
+function plan = configureInitialModelParallelism(dims, optParams)
+    % 根据问题规模和可用许可配置初始模型并行生成计划
+    if nargin < 2
+        optParams = struct();
+    end
+    plan = struct('enableParallel', false, 'numCandidates', 1, ...
+        'numWorkers', 0, 'seeds', []);
+    problemSize = prod(dims);
+    candidateHint = max(3, min(ceil(problemSize / 8e4), 10));
+    if candidateHint <= 1
+        return;
+    end
+    try
+        hasLicense = license('test', 'Distrib_Computing_Toolbox');
+    catch
+        hasLicense = false;
+    end
+    if ~hasLicense
+        return;
+    end
+    useParallel = shouldUseParallel(candidateHint, problemSize);
+    if ~useParallel
+        return;
+    end
+    pool = [];
+    try
+        pool = gcp('nocreate');
+    catch
+        pool = [];
+    end
+    if isempty(pool)
+        try
+            parpool('local');
+            pool = gcp('nocreate');
+        catch
+            pool = [];
+        end
+    end
+    if isempty(pool)
+        return;
+    end
+    plan.enableParallel = true;
+    plan.numWorkers = pool.NumWorkers;
+    plan.numCandidates = max(3, min(2 * pool.NumWorkers, 12));
+    previousState = rng;
+    rng('shuffle');
+    plan.seeds = randi([1, 1e9], plan.numCandidates, 1);
+    rng(previousState);
+    if isfield(optParams, 'preserveSmallPores') && optParams.preserveSmallPores
+        plan.numCandidates = max(plan.numCandidates, 4);
+    end
+end
+function [bestModel, diagnostics] = generateParallelInitialCandidates(dims, targetPorosity, ...
+    originalFeatures, spatialFeatures, morphologyFeatures, optParams, densityMap, ...
+    correlationLength, targetAnisotropy, parallelPlan)
+    % 使用并行化生成多个初始候选模型，从中选择最优模型
+    numCandidates = max(1, parallelPlan.numCandidates);
+    seeds = parallelPlan.seeds;
+    if numel(seeds) < numCandidates
+        previousState = rng;
+        rng('shuffle');
+        extraSeeds = randi([1, 1e9], numCandidates, 1);
+        rng(previousState);
+        seeds = extraSeeds;
+    end
+    candidateModels = cell(numCandidates, 1);
+    candidateSummaries = repmat(struct('spatialMatch', 0, 'morphologyMatch', 0, ...
+        'porosity', 0, 'compositeScore', 0, 'seed', NaN), numCandidates, 1);
+    parfor idx = 1:numCandidates
+        localSeed = seeds(idx);
+        rng(localSeed, 'twister');
+        baseFieldCandidate = synthesizeDirectionalGaussianField(dims, correlationLength, ...
+            targetAnisotropy, spatialFeatures, optParams, localSeed);
+        baseFieldCandidate = blendReferenceDirectionalPatterns(baseFieldCandidate, densityMap);
+        [candidateModel, summary] = finalizeInitialCandidateModel(baseFieldCandidate, densityMap, ...
+            targetPorosity, originalFeatures, spatialFeatures, morphologyFeatures, optParams, true);
+        summary.seed = localSeed;
+        candidateModels{idx} = candidateModel;
+        candidateSummaries(idx) = summary; %#ok<PFOUS>
+    end
+    scores = arrayfun(@(s) s.compositeScore, candidateSummaries);
+    [bestScore, bestIdx] = max(scores);
+    bestModel = candidateModels{bestIdx};
+    bestSummary = candidateSummaries(bestIdx);
+    diagnostics = struct();
+    diagnostics.bestSpatialMatch = bestSummary.spatialMatch;
+    diagnostics.bestMorphologyMatch = bestSummary.morphologyMatch;
+    diagnostics.bestPorosity = bestSummary.porosity;
+    diagnostics.bestScore = bestScore;
+    diagnostics.seeds = seeds;
+    diagnostics.spatialMatches = arrayfun(@(s) s.spatialMatch, candidateSummaries);
+    diagnostics.morphologyMatches = arrayfun(@(s) s.morphologyMatch, candidateSummaries);
+end
+function [model, summary] = finalizeInitialCandidateModel(baseField, densityMap, targetPorosity, ...
+    originalFeatures, spatialFeatures, morphologyFeatures, optParams, computeSummary)
+    % 将基础场转化为满足初始要求的候选模型
+    if nargin < 8
+        computeSummary = false;
+    end
+    threshold = computeAdaptiveThreshold(baseField, targetPorosity, optParams);
+    model = baseField > threshold;
+    model = reinforceDensityTargets(model, densityMap, targetPorosity);
+    model = applyTargetMorphology(model, morphologyFeatures);
+    model = adjustClusterSizeDistribution(model, optParams);
+    model = enforceClusterSizeConstraints(model, optParams);
+    model = embedRepresentativeClusters(model, densityMap, optParams, morphologyFeatures);
+    model = matchPoreSizeDistribution(model, originalFeatures, optParams);
+    if ~computeSummary
+        summary = struct();
+        return;
+    end
+    summary = struct();
+    summary.spatialMatch = calculateSpatialMatch(computeEnhancedSpatialFeatures(model), spatialFeatures);
+    summary.morphologyMatch = calculateMorphologyMatch(computeDetailedMorphologyFeatures(model), morphologyFeatures);
+    summary.porosity = mean(model(:));
+    summary.compositeScore = computeInitialCandidateScore(summary.spatialMatch, ...
+        summary.morphologyMatch, summary.porosity, targetPorosity);
+    summary.seed = NaN;
+end
+function score = computeInitialCandidateScore(spatialMatch, morphologyMatch, porosity, targetPorosity)
+    % 根据多项指标综合评分初始候选
+    porosityScore = max(0, 1 - abs(porosity - targetPorosity) * 4);
+    score = 0.45 * spatialMatch + 0.45 * morphologyMatch + 0.10 * porosityScore;
+end
 function field = synthesizeDirectionalGaussianField(dims, correlationLength, anisotropy, ...
-    spatialFeatures, optParams)
+    spatialFeatures, optParams, randomSeed)
     % 生成包含方向性与梯度的相关高斯场
+    if nargin < 6
+        randomSeed = [];
+    end
+    if ~isempty(randomSeed)
+        rng(randomSeed, 'twister');
+    end
     whiteNoise = randn(dims);
     [X, Y, Z] = meshgrid(-dims(1)/2:dims(1)/2-1, ...
         -dims(2)/2:dims(2)/2-1, ...
