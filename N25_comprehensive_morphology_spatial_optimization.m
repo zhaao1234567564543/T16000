@@ -1089,8 +1089,28 @@ function grad = computePorosityGradient(binaryModel)
         end
     end
     
-    % 计算梯度幅值
-    [gx, gy, gz] = gradient(localPorosity);
+    % 计算梯度幅值（兼容不同维度的局部孔隙率图）
+    localPorosity = squeeze(localPorosity);
+
+    if numel(localPorosity) <= 1
+        grad = 0;
+        return;
+    end
+
+    if isvector(localPorosity)
+        g = gradient(localPorosity);
+        grad = mean(abs(g(:)));
+        return;
+    end
+
+    dims = ndims(localPorosity);
+    switch dims
+        case 2
+            [gx, gy] = gradient(localPorosity);
+            gz = zeros(size(localPorosity));
+        otherwise
+            [gx, gy, gz] = gradient(localPorosity);
+    end
     grad = mean(sqrt(gx(:).^2 + gy(:).^2 + gz(:).^2));
 end
 function connectivity = computeConnectivityMetrics(binaryModel)
