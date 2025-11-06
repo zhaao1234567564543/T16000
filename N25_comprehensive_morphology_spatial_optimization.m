@@ -4851,12 +4851,12 @@ function model = connectClusters(model, cluster1, cluster2)
     distanceField = bwdist(subModel);
     costVolume = costVolume + normalizeVolume(distanceField);
     costVolume(subModel) = costVolume(subModel) * 0.3;
-    if exist(''graydist'', ''file'') == 2
-        dist1 = graydist(costVolume, surface1, ''quasi-euclidean'');
-        dist2 = graydist(costVolume, surface2, ''quasi-euclidean'');
+    if exist('graydist', 'file') == 2
+        dist1 = graydist(costVolume, surface1, 'quasi-euclidean');
+        dist2 = graydist(costVolume, surface2, 'quasi-euclidean');
     else
-        dist1 = bwdistgeodesic(true(subSize), surface1, ''quasi-euclidean'');
-        dist2 = bwdistgeodesic(true(subSize), surface2, ''quasi-euclidean'');
+        dist1 = bwdistgeodesic(true(subSize), surface1, 'quasi-euclidean');
+        dist2 = bwdistgeodesic(true(subSize), surface2, 'quasi-euclidean');
     end
     totalCost = dist1 + dist2;
     totalCost(~isfinite(totalCost)) = inf;
