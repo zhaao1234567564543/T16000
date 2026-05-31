@@ -1,4 +1,4 @@
-Here is the draft README.md file tailored for your MATLAB source code, translated into English. This code is clearly an advanced algorithm designed for digital core construction, reservoir microstructure analysis, or 3D reconstruction of porous media. You can directly copy and paste the following Markdown content into your code repository.
+
 
 Comprehensive Morphology and Spatial Feature Optimization Reconstruction Model for 3D Porous Media
 This project provides an advanced, MATLAB-based 3D porous media (e.g., digital core) reconstruction algorithm. By combining Markov Chain Monte Carlo (MCMC) methods with Simulated Annealing strategies, this program accurately reconstructs 3D models while precisely matching the spatial topological structures and microscopic morphological features of the original data.
